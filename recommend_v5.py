@@ -28,7 +28,14 @@ def _effective_now():
     return datetime.now()
 
 path = '/home/claude/snatched_beauty_box_master.xlsx'
-wb   = openpyxl.load_workbook(path)
+try:
+    wb = openpyxl.load_workbook(path)
+except FileNotFoundError:
+    # This is expected when running as a deployed web service (Render) —
+    # that local file only exists in the development sandbox. The real
+    # workbook always arrives fresh with each request via set_workbook_path(),
+    # called by app.py before any recommendation logic runs.
+    wb = None
 
 def set_workbook_path(new_path):
     """Reloads the workbook from a different file — used by the web service
