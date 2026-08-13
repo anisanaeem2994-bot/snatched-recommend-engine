@@ -27,14 +27,15 @@ def _effective_now():
         return datetime.strptime(TARGET_MONTH + '-01', '%Y-%m-%d')
     return datetime.now()
 
-path = '/home/claude/snatched_beauty_box_master.xlsx'
+import os
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+path = os.path.join(_this_dir, 'snatched_beauty_box_master.xlsx')  # always
+    # finds the bundled file relative to this script's own real location,
+    # rather than depending on whatever folder the server happens to be
+    # run from (which caused wb to silently become None on Render).
 try:
     wb = openpyxl.load_workbook(path)
 except FileNotFoundError:
-    # This is expected when running as a deployed web service (Render) —
-    # that local file only exists in the development sandbox. The real
-    # workbook always arrives fresh with each request via set_workbook_path(),
-    # called by app.py before any recommendation logic runs.
     wb = None
 
 def set_workbook_path(new_path):
