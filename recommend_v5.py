@@ -29,12 +29,19 @@ def _effective_now():
 
 import os
 _this_dir = os.path.dirname(os.path.abspath(__file__))
-path = os.path.join(_this_dir, 'snatched_beauty_box_master.xlsx')  # always
-    # finds the bundled file relative to this script's own real location,
-    # rather than depending on whatever folder the server happens to be
-    # run from (which caused wb to silently become None on Render).
+
+def _find_bundled_workbook():
+    """Looks for the bundled spreadsheet regardless of its exact filename —
+    picks whichever .xlsx file is sitting alongside this script. This avoids
+    needing to match one specific exact filename on GitHub."""
+    for fname in os.listdir(_this_dir):
+        if fname.lower().endswith('.xlsx'):
+            return os.path.join(_this_dir, fname)
+    return None
+
+path = _find_bundled_workbook()
 try:
-    wb = openpyxl.load_workbook(path)
+    wb = openpyxl.load_workbook(path) if path else None
 except FileNotFoundError:
     wb = None
 
