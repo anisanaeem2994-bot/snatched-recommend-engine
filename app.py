@@ -90,32 +90,71 @@ def recommend_endpoint():
 
 @app.route('/swap', methods=['POST'])
 def swap_endpoint():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No spreadsheet file was sent.'}), 400
+    """Simplified — Make.com only needs to tell us WHICH ROW changed in
+    pending_approval. We figure out the customer/category/tier ourselves
+    by reading that row directly, instead of asking Make.com to extract
+    those pieces separately (which its Watch Changes trigger can't cleanly do)."""
+    row_number = request.form.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(row_number)
 
-    customer_name = request.form.get('customer_name')
-    category = request.form.get('category')
-    tier = request.form.get('tier')
-    if not all([customer_name, category, tier]):
-        return jsonify({'error': 'customer_name, category, and tier are all required.'}), 400
-
+    sheet_name = request.form.get('sheet_name', 'pending_approval')
     already_rejected = request.form.get('already_rejected', '')
     already_rejected = [s.strip() for s in already_rejected.split(',') if s.strip()]
-
-    current_box_products = request.form.get('current_box_products', '')
-    current_box_products = [s.strip() for s in current_box_products.split(',') if s.strip()]
-
     target_month = request.form.get('target_month') or None
-
-    uploaded = request.files['file']
-    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-        uploaded.save(tmp.name)
-        tmp_path = tmp.name
 
     try:
         importlib.reload(recommend_v5)
-        recommend_v5.set_workbook_path(tmp_path)
         recommend_v5.set_target_month(target_month)
+
+        ws = recommend_v5.wb[sheet_name]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        name_col = headers.index('Product Name') + 1
+        cat_col = headers.index('Category') + 1
+        tier_col = headers.index('Tier') + 1
+
+        category = ws.cell(row_number, cat_col).value
+        tier = ws.cell(row_number, tier_col).value
+        current_product = ws.cell(row_number, name_col).value
+
+        # The product currently sitting in this slot must never be
+        # recommended back to itself as the "next alternative".
+        if current_product and current_product not in already_rejected:
+            already_rejected = already_rejected + [current_product]
+
+        # Find which customer this row belongs to by scanning upward for
+        # the nearest customer-header row above it.
+        customer_name = None
+        for r in range(row_number, 0, -1):
+            fc = ws.cell(r, 1).value
+            if isinstance(fc, str) and '|' in fc and 'Month:' in fc:
+                customer_name = fc.split('|')[0].strip()
+                break
+        if not customer_name:
+            return jsonify({'error': f'Could not find which customer owns row {row_number}.'}), 400
+
+        # Also collect the other 4 products already in this customer's box,
+        # so we don't recommend the same brand twice.
+        current_box_products = []
+        r = row_number
+        while True:
+            n = ws.cell(r, headers.index('#') + 1).value
+            if not isinstance(n, (int, float)):
+                break
+            prod = ws.cell(r, name_col).value
+            if r != row_number and prod:
+                current_box_products.append(prod)
+            r -= 1
+        r = row_number + 1
+        while True:
+            n = ws.cell(r, headers.index('#') + 1).value
+            if not isinstance(n, (int, float)):
+                break
+            prod = ws.cell(r, name_col).value
+            if prod:
+                current_box_products.append(prod)
+            r += 1
 
         product, message = recommend_v5.get_next_alternative(
             customer_name, category, tier, already_rejected, current_box_products
@@ -136,8 +175,6 @@ def swap_endpoint():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        os.unlink(tmp_path)
 
 @app.route('/generate_month', methods=['POST'])
 def generate_month_endpoint():
