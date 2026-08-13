@@ -278,6 +278,7 @@ def generate_month_formatted_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/commit_month', methods=['POST'])
 def commit_month_endpoint():
     """Called when the owner clicks 'Approve & Lock In' for a month.
     Reads the CURRENT state of the spreadsheet directly — whatever she's
@@ -370,5 +371,6 @@ def commit_month_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
