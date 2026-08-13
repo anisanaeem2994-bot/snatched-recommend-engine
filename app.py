@@ -104,7 +104,7 @@ def swap_endpoint():
     row_number = request.form.get('row_number')
     if not row_number:
         return jsonify({'error': 'row_number is required.'}), 400
-    row_number = int(row_number)
+    row_number = int(float(row_number))
 
     sheet_name = request.form.get('sheet_name', 'pending_approval')
     already_rejected = request.form.get('already_rejected', '')
