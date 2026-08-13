@@ -110,6 +110,7 @@ def swap_endpoint():
     already_rejected = request.form.get('already_rejected', '')
     already_rejected = [s.strip() for s in already_rejected.split(',') if s.strip()]
     target_month = request.form.get('target_month') or None
+    print(f'DEBUG /swap received: row_number={row_number}, sheet_name={sheet_name!r}, target_month={target_month!r}', flush=True)
 
     try:
         importlib.reload(recommend_v5)
@@ -124,6 +125,7 @@ def swap_endpoint():
         category = ws.cell(row_number, cat_col).value
         tier = ws.cell(row_number, tier_col).value
         current_product = ws.cell(row_number, name_col).value
+        print(f'DEBUG /swap resolved: category={category!r}, tier={tier!r}, current_product={current_product!r}, workbook_path={recommend_v5.path!r}', flush=True)
 
         # The product currently sitting in this slot must never be
         # recommended back to itself as the "next alternative".
