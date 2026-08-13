@@ -31,13 +31,19 @@ import os
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 
 def _find_bundled_workbook():
-    """Looks for the bundled spreadsheet regardless of its exact filename —
-    picks whichever .xlsx file is sitting alongside this script. This avoids
-    needing to match one specific exact filename on GitHub."""
+    """Looks for the bundled spreadsheet — if more than one .xlsx file is
+    sitting alongside this script (e.g. an old one that failed to delete
+    on GitHub), picks whichever was modified most recently, so it doesn't
+    randomly grab a stale file."""
+    candidates = []
     for fname in os.listdir(_this_dir):
         if fname.lower().endswith('.xlsx'):
-            return os.path.join(_this_dir, fname)
-    return None
+            full = os.path.join(_this_dir, fname)
+            candidates.append((os.path.getmtime(full), full))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 path = _find_bundled_workbook()
 try:
