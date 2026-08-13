@@ -32,6 +32,13 @@ import importlib
 import recommend_v5
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25MB — the exported
+                                                        # spreadsheet with all
+                                                        # sheets can be a few MB;
+                                                        # Flask's default limit
+                                                        # is much smaller and was
+                                                        # silently rejecting it
+                                                        # (413 error) before this.
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -232,7 +239,45 @@ def generate_month_endpoint():
     finally:
         os.unlink(tmp_path)
 
-@app.route('/commit_month', methods=['POST'])
+@app.route('/generate_month_formatted', methods=['POST'])
+def generate_month_formatted_endpoint():
+    """Does the whole job in one call: generates recommendations for every
+    due customer AND writes them into a properly formatted sheet (pink
+    headers, purple customer rows — same style as every month built so
+    far), reusing the same tested build_month_sheet() function. Returns
+    the ready-to-use file — Make.com just uploads it back to replace the
+    live Google Sheet, no Iterator or row-by-row writing needed at all."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No spreadsheet file was sent.'}), 400
+    target_month = request.form.get('target_month')
+    sheet_name = request.form.get('sheet_name')
+    if not target_month:
+        return jsonify({'error': 'target_month is required, e.g. 2026-10'}), 400
+    if not sheet_name:
+        sheet_name = f'pending_approval_{target_month.replace("-", "_")}'
+
+    uploaded = request.files['file']
+    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+        uploaded.save(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        import build_final_sheet
+        importlib.reload(recommend_v5)
+        importlib.reload(build_final_sheet)
+        recommend_v5.set_workbook_path(tmp_path)
+        recommend_v5.set_target_month(target_month)
+        build_final_sheet.set_sheet_path(tmp_path)
+
+        build_final_sheet.build_month_sheet(target_month, sheet_name)
+
+        from flask import send_file
+        return send_file(tmp_path, as_attachment=True,
+                          download_name='snatched_beauty_box_master_updated.xlsx')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 def commit_month_endpoint():
     """Called when the owner clicks 'Approve & Lock In' for a month.
     Reads the CURRENT state of the spreadsheet directly — whatever she's
