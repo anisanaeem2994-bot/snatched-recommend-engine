@@ -31,6 +31,46 @@ import tempfile
 import importlib
 import recommend_v5
 
+import requests
+import base64 as base64_lib
+
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+GITHUB_REPO = 'anisanaeem2994-bot/snatched-recommend-engine'
+GITHUB_FILE_PATH = 'snatched_beauty_box_master.xlsx'
+
+def push_to_github():
+    """Called automatically after any real change (approve, unapprove,
+    finalize) — immediately saves the current state to GitHub, so it
+    survives even if Render restarts a moment later. Uses Python's own
+    reliable requests + base64 libraries directly, not Make.com's fragile
+    binary handling (which corrupted a file earlier today)."""
+    if not GITHUB_TOKEN:
+        print('WARNING: GITHUB_TOKEN not set — changes will NOT survive a restart.', flush=True)
+        return False
+    try:
+        headers = {'Authorization': f'token {GITHUB_TOKEN}'}
+        get_url = f'https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}'
+        current = requests.get(get_url, headers=headers, timeout=15)
+        sha = current.json().get('sha') if current.status_code == 200 else None
+
+        with open(recommend_v5.path, 'rb') as f:
+            content_b64 = base64_lib.b64encode(f.read()).decode('utf-8')
+
+        payload = {'message': 'Auto-save after approval/change', 'content': content_b64}
+        if sha:
+            payload['sha'] = sha
+
+        resp = requests.put(get_url, headers=headers, json=payload, timeout=30)
+        if resp.status_code in (200, 201):
+            print('Successfully pushed changes to GitHub.', flush=True)
+            return True
+        else:
+            print(f'GitHub push failed: {resp.status_code} {resp.text[:200]}', flush=True)
+            return False
+    except Exception as e:
+        print(f'GitHub push error: {e}', flush=True)
+        return False
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
@@ -215,6 +255,7 @@ def approve_item_endpoint():
             return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
 
         recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
         return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -255,6 +296,7 @@ def unapprove_item_endpoint():
             return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
 
         recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
         return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -356,21 +398,15 @@ def generate_month_endpoint():
     in ONE call — not one customer at a time. This matters: it shares stock
     tracking across all customers in the same call, so two different
     customers can never accidentally get recommended the same last-1-in-stock
-    item within the same month's batch."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No spreadsheet file was sent.'}), 400
+    item within the same month's batch. Uses the bundled file directly —
+    no file upload needed, avoiding the corruption risk of the Google Drive
+    export method."""
     target_month = request.form.get('target_month')
     if not target_month:
         return jsonify({'error': 'target_month is required, e.g. 2026-09'}), 400
 
-    uploaded = request.files['file']
-    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-        uploaded.save(tmp.name)
-        tmp_path = tmp.name
-
     try:
         importlib.reload(recommend_v5)
-        recommend_v5.set_workbook_path(tmp_path)
         recommend_v5.set_target_month(target_month)
         recommend_v5.reset_allocations()
 
@@ -403,8 +439,6 @@ def generate_month_endpoint():
         return jsonify({'target_month': target_month, 'customers': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        os.unlink(tmp_path)
 
 @app.route('/generate_month_formatted', methods=['POST'])
 def generate_month_formatted_endpoint():
@@ -471,6 +505,7 @@ def finalize_item_endpoint():
         ws_items.append([f'BI{next_item_num:05d}', customer_name, customer_id, target_month, box_type, box_id, product_name])
 
         recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
         return jsonify({'success': True, 'item_added': product_name, 'box_id': box_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -496,6 +531,7 @@ def create_box_record_endpoint():
         ws_boxes.append([box_id, customer_id, customer_name, target_month, 'sent', box_type])
 
         recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
         return jsonify({'success': True, 'box_id': box_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
