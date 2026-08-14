@@ -32,7 +32,16 @@ import importlib
 import recommend_v5
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25MB — the exported
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
+
+@app.after_request
+def add_cors_headers(response):
+    # Lets the customer-lookup dashboard webpage call this service directly
+    # from the browser (a different "origin" than Render itself).
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response  # 25MB — the exported
                                                         # spreadsheet with all
                                                         # sheets can be a few MB;
                                                         # Flask's default limit
@@ -45,6 +54,77 @@ def health_check():
     # Simple endpoint to confirm the service is alive — Make.com or a
     # browser can hit this to check the deployment worked.
     return jsonify({'status': 'ok', 'service': 'snatched-recommend-engine'})
+
+@app.route('/customer_lookup', methods=['GET'])
+def customer_lookup_endpoint():
+    """Powers the customer-details dashboard. Given a customer's name,
+    returns everything Iqra would otherwise have to hunt across multiple
+    sheets for: full product history, skin type/preferences, quiz answers,
+    and frequency settings — reusing the same tested data-loading logic
+    the recommendation engine itself relies on."""
+    customer_name = request.args.get('name')
+    if not customer_name:
+        return jsonify({'error': 'name is required, e.g. ?name=Sandra Hoffmann'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        customers = recommend_v5.load_customers()
+        cust = next((c for c in customers.values() if c['name'].lower() == customer_name.lower()), None)
+        if not cust:
+            return jsonify({'error': f'No customer found named "{customer_name}".'}), 404
+        cid = cust['id']
+
+        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+        product_history = sorted(all_rec.get(cid, []), key=lambda x: x[1] if len(x) > 1 else '')
+
+        quiz = recommend_v5.load_quiz().get(cid, {})
+        prefs = recommend_v5.load_preferences().get(cid, {})
+        freqs = recommend_v5.load_frequencies().get(cid, {})
+
+        return jsonify({
+            'customer_name': cust['name'],
+            'customer_id': cid,
+            'box_type': cust.get('box_type'),
+            'billing_cadence': cust.get('billing_cadence'),
+            'subscribed_since': cust.get('subscribed_since'),
+            'notes': cust.get('notes'),
+            'product_history': [
+                {'product': p[0], 'month': p[1] if len(p) > 1 else None}
+                for p in product_history
+            ],
+            'quiz': quiz,
+            'preferences': prefs,
+            'frequencies': freqs,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/customer_search_product', methods=['GET'])
+def customer_search_product_endpoint():
+    """Checks whether a specific customer has ever received a specific
+    product before — the 'has she had this already' search Iqra wants."""
+    customer_name = request.args.get('name')
+    product_query = request.args.get('product', '').lower()
+    if not customer_name or not product_query:
+        return jsonify({'error': 'both name and product are required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        customers = recommend_v5.load_customers()
+        cust = next((c for c in customers.values() if c['name'].lower() == customer_name.lower()), None)
+        if not cust:
+            return jsonify({'error': f'No customer found named "{customer_name}".'}), 404
+        cid = cust['id']
+
+        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+        matches = [
+            {'product': p[0], 'month': p[1] if len(p) > 1 else None}
+            for p in all_rec.get(cid, [])
+            if product_query in p[0].lower()
+        ]
+        return jsonify({'customer_name': cust['name'], 'query': product_query, 'matches': matches, 'has_received': len(matches) > 0})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/recommend', methods=['POST'])
 def recommend_endpoint():
@@ -94,6 +174,91 @@ def recommend_endpoint():
         return jsonify({'error': str(e)}), 500
     finally:
         os.unlink(tmp_path)
+
+@app.route('/approve_item', methods=['POST'])
+def approve_item_endpoint():
+    """Called the moment a row gets marked 'approved'. Immediately
+    decrements that product's stock in the bundled file (and saves it to
+    disk) so every other customer's swap check from this point on sees
+    the real, reduced number — preventing the same last-1-in-stock item
+    from being offered to two different customers before either is
+    actually finalized."""
+    row_number = request.form.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(float(row_number))
+    sheet_name = request.form.get('sheet_name', 'pending_approval')
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = recommend_v5.wb[sheet_name]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        name_col = headers.index('Product Name') + 1
+        product_name = ws.cell(row_number, name_col).value
+        if not product_name:
+            return jsonify({'error': f'No product found in row {row_number}.'}), 400
+
+        ws_inv = recommend_v5.wb['inventory']
+        hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+        n_col = hi.index('name') + 1
+        s_col = hi.index('stock_qty') + 1
+        updated = False
+        for row in ws_inv.iter_rows(min_row=2):
+            if row[n_col-1].value == product_name:
+                old_stock = row[s_col-1].value or 0
+                row[s_col-1].value = max(0, old_stock - 1)
+                updated = True
+                new_stock = row[s_col-1].value
+                break
+
+        if not updated:
+            return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
+
+        recommend_v5.wb.save(recommend_v5.path)
+        return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/unapprove_item', methods=['POST'])
+def unapprove_item_endpoint():
+    """Reverses /approve_item — used if the owner changes her mind after
+    approving something. Increments that product's stock back by 1."""
+    row_number = request.form.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(float(row_number))
+    sheet_name = request.form.get('sheet_name', 'pending_approval')
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = recommend_v5.wb[sheet_name]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        name_col = headers.index('Product Name') + 1
+        product_name = ws.cell(row_number, name_col).value
+        if not product_name:
+            return jsonify({'error': f'No product found in row {row_number}.'}), 400
+
+        ws_inv = recommend_v5.wb['inventory']
+        hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+        n_col = hi.index('name') + 1
+        s_col = hi.index('stock_qty') + 1
+        updated = False
+        for row in ws_inv.iter_rows(min_row=2):
+            if row[n_col-1].value == product_name:
+                old_stock = row[s_col-1].value or 0
+                row[s_col-1].value = old_stock + 1
+                updated = True
+                new_stock = row[s_col-1].value
+                break
+
+        if not updated:
+            return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
+
+        recommend_v5.wb.save(recommend_v5.path)
+        return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/swap', methods=['POST'])
 def swap_endpoint():
@@ -280,7 +445,62 @@ def generate_month_formatted_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/commit_month', methods=['POST'])
+@app.route('/finalize_item', methods=['POST'])
+def finalize_item_endpoint():
+    """Called once per approved row, using data Make.com already has from
+    a simple Search Rows step — no file export needed at all, avoiding
+    the binary/Base64 corruption risk entirely. Since Handle Approval
+    already decremented stock in real time as things were approved, this
+    only needs to create the permanent box/box_item record — not touch
+    stock again."""
+    customer_name = request.form.get('customer_name')
+    customer_id = request.form.get('customer_id')
+    box_type = request.form.get('box_type')
+    product_name = request.form.get('product_name')
+    target_month = request.form.get('target_month')
+    box_id = request.form.get('box_id')  # same for all 5 items in one customer's box
+
+    if not all([customer_name, customer_id, product_name, target_month, box_id]):
+        return jsonify({'error': 'customer_name, customer_id, product_name, target_month, and box_id are all required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        ws_items = recommend_v5.wb['box_items']
+        next_item_num = ws_items.max_row
+        next_item_num += 1
+        ws_items.append([f'BI{next_item_num:05d}', customer_name, customer_id, target_month, box_type, box_id, product_name])
+
+        recommend_v5.wb.save(recommend_v5.path)
+        return jsonify({'success': True, 'item_added': product_name, 'box_id': box_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/create_box_record', methods=['POST'])
+def create_box_record_endpoint():
+    """Called once per customer (not per item) to create the parent 'box'
+    record. Returns a real box_id for Make.com to reuse across that
+    customer's 5 separate /finalize_item calls."""
+    customer_name = request.form.get('customer_name')
+    customer_id = request.form.get('customer_id')
+    box_type = request.form.get('box_type')
+    target_month = request.form.get('target_month')
+
+    if not all([customer_name, customer_id, target_month]):
+        return jsonify({'error': 'customer_name, customer_id, and target_month are all required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        ws_boxes = recommend_v5.wb['boxes']
+        next_box_num = ws_boxes.max_row + 1
+        box_id = f'BOX{next_box_num:04d}'
+        ws_boxes.append([box_id, customer_id, customer_name, target_month, 'sent', box_type])
+
+        recommend_v5.wb.save(recommend_v5.path)
+        return jsonify({'success': True, 'box_id': box_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 def commit_month_endpoint():
     """Called when the owner clicks 'Approve & Lock In' for a month.
     Reads the CURRENT state of the spreadsheet directly — whatever she's
