@@ -440,6 +440,121 @@ def generate_month_endpoint():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/generate_month_rows', methods=['POST'])
+def generate_month_rows_endpoint():
+    """Returns a pre-flattened, ready-to-write list of rows — one header
+    row per customer, immediately followed by their 5 product rows —
+    already in the exact order they need to appear in the sheet. This
+    means Make.com only needs ONE simple loop (the same reliable pattern
+    already used tonight), not nested loops, avoiding real fragility."""
+    target_month = request.form.get('target_month')
+    if not target_month:
+        return jsonify({'error': 'target_month is required, e.g. 2026-10'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        recommend_v5.set_target_month(target_month)
+        recommend_v5.reset_allocations()
+
+        customers = recommend_v5.load_customers()
+        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+
+        rows = []
+        for cid, cust in customers.items():
+            due, reason = recommend_v5.is_customer_due(cust, box_timeline, target_month)
+            if not due:
+                continue
+            out = recommend_v5.recommend(cust['name'])
+            if isinstance(out, str):
+                continue
+            (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
+             hist_pat, total, timeline, inv_cat_map, value_summary) = out
+
+            timeline_for_cust = box_timeline.get(cid, [])
+            last_box = timeline_for_cust[-1][0] if timeline_for_cust else 'N/A'
+            age = ''
+            bday = cust.get('birthday')
+            if bday:
+                try:
+                    from datetime import datetime as _dt
+                    bdate = _dt.strptime(str(bday)[:10], '%Y-%m-%d')
+                    today = _dt.now()
+                    age = today.year - bdate.year - ((today.month, today.day) < (bdate.month, bdate.day))
+                except Exception:
+                    age = ''
+
+            prefs = recommend_v5.load_preferences().get(cid, {})
+            freqs = recommend_v5.load_frequencies().get(cid, {})
+            quiz = recommend_v5.load_quiz().get(cid, {})
+
+            header_text = f"  {c['name']}   |   {c['box_type']}   |   Last box: {last_box}   |   Month: {target_month}, Age {age}"
+
+            rows.append({
+                'row_type': 'header',
+                'column_a': header_text,
+                'customer_name': c['name'],
+                'month': target_month,
+            })
+            for p in picks:
+                why_text = recommend_v5.build_explanation(
+                    p, cid, hard_block, soft_avoid, hist_pat, total,
+                    timeline, inv_cat_map, prefs, freqs, quiz, age, cust.get('notes', '')
+                )
+                rows.append({
+                    'row_type': 'product',
+                    'product_name': p['name'],
+                    'category': p['category'],
+                    'tier': p['tier'],
+                    'stock': p['stock'],
+                    'price_aed': p.get('retail_price_aed'),
+                    'why_recommended': why_text,
+                    'customer_name': c['name'],
+                    'month': target_month,
+                })
+
+        return jsonify({'target_month': target_month, 'rows': rows, 'row_count': len(rows)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    target_month = request.form.get('target_month')
+    if not target_month:
+        return jsonify({'error': 'target_month is required, e.g. 2026-09'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        recommend_v5.set_target_month(target_month)
+        recommend_v5.reset_allocations()
+
+        customers = recommend_v5.load_customers()
+        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+
+        results = []
+        for cid, cust in customers.items():
+            due, reason = recommend_v5.is_customer_due(cust, box_timeline, target_month)
+            if not due:
+                continue
+            out = recommend_v5.recommend(cust['name'])
+            if isinstance(out, str):
+                continue
+            (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
+             hist_pat, total, timeline, inv_cat_map, value_summary) = out
+            results.append({
+                'customer_name': c['name'],
+                'customer_id': c['id'],
+                'box_type': c['box_type'],
+                'products': [
+                    {'name': p['name'], 'category': p['category'], 'tier': p['tier'],
+                     'stock': p['stock'], 'price_aed': p.get('retail_price_aed')}
+                    for p in picks
+                ],
+                'value_summary': value_summary,
+                'warnings': warnings,
+            })
+
+        return jsonify({'target_month': target_month, 'customers': results})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/generate_month_formatted', methods=['POST'])
 def generate_month_formatted_endpoint():
     """Does the whole job in one call: generates recommendations for every
