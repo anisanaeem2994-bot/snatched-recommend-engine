@@ -316,11 +316,9 @@
         <select id="addInvCategory" class="cat-select" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
           <option value="">Category (new products only)</option>
         </select>
-        <select id="addInvTier" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <select id="addInvTier" title="This is the product's own tier, not a box type — every real product is Essentials or Prestige. Mixed boxes just draw from both pools, they're not a tier a product itself belongs to." style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
           <option value="">Tier (new products only)</option>
           <option value="Essentials">Essentials</option>
-          <option value="Mixed Glam X">Mixed Glam X</option>
-          <option value="Mixed Glam XXX">Mixed Glam XXX</option>
           <option value="Prestige">Prestige</option>
         </select>
       </div>
@@ -603,6 +601,7 @@ function renderItemRow(it){
           : `<button class="btn btn-swap" onclick="doSwap(${it.row_number})" title="Next alternative in the same category (${it.category})">↻ Swap</button>
              <select class="cat-select" onchange="doSwapCategory(${it.row_number}, this.value)" title="Swap into a different category instead">
                <option value="">↕ Other category…</option>
+               ${categoryOptionsHTML()}
              </select>
              <button class="btn manual-toggle" onclick="toggleManual(${it.row_number})">✏️ Enter my own</button>
              <button class="btn btn-approve" onclick="approve(${it.row_number})">✓ Approve</button>`
@@ -620,23 +619,44 @@ function renderItemRow(it){
   `;
 }
 
-/* categories for the "Other category" dropdown, filled in once inventory is fetched */
+/* categories for the "Other category" dropdown on every item row. Built
+   fresh from inventoryCatalog every time a row is rendered — NOT populated
+   once via a DOM pass, because the review page rebuilds every item row
+   from scratch after every single action (swap/approve/undo/manual pick),
+   which was silently wiping these dropdowns back to empty after the very
+   first render (the old code only ever filled them in once, the first
+   time ensureInventory() ran, and never again after that). That's why
+   "Other category" looked broken on both phone and laptop — it wasn't a
+   device issue, it just stopped getting re-filled after your first action. */
+function categoryOptionsHTML(){
+  if(!inventoryCatalog) return '';
+  const cats = [...new Set(inventoryCatalog.map(p=>p.category))].sort();
+  return cats.map(c=>`<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
+}
+
 async function ensureInventory(){
   if(inventoryCatalog) return inventoryCatalog;
-  const data = await api('/dashboard/inventory');
+  // all=1: this list drives the "Other category" dropdown and the "Add
+  // inventory" category/name autocomplete -- using the in-stock-only
+  // default here would mean a category that's completely sold out (e.g.
+  // every highlighter is at 0) just silently vanishes from both, right
+  // when it's most needed (restocking or adding a new one in that exact
+  // category). Actual pick eligibility is still checked for real, in
+  // stock, server-side by swap/manual_pick regardless of what's in this
+  // list -- this is only ever used to build dropdown options.
+  const data = await api('/dashboard/inventory?all=1');
   inventoryCatalog = (data && data.items) || [];
-  const cats = [...new Set(inventoryCatalog.map(p=>p.category))].sort();
-  document.querySelectorAll('.cat-select').forEach(sel=>{
-    cats.forEach(c=>{
-      const opt = document.createElement('option');
-      opt.value = c; opt.textContent = c;
-      sel.appendChild(opt);
-    });
-  });
+  const addInvCat = document.getElementById('addInvCategory');
+  if(addInvCat) addInvCat.innerHTML = '<option value="">Category (new products only)</option>' + categoryOptionsHTML();
   const nameList = document.getElementById('addInvNameList');
   if(nameList){
     nameList.innerHTML = inventoryCatalog.map(p=>`<option value="${(p.name||'').replace(/"/g,'&quot;')}"></option>`).join('');
   }
+  // If the board already rendered before inventory finished loading, its
+  // item rows went out with no category options -- refresh them now that
+  // we actually have the list, instead of leaving them permanently empty
+  // until the next unrelated action happens to re-render the board.
+  if(boardCustomers && boardCustomers.length) renderReview();
   return inventoryCatalog;
 }
 

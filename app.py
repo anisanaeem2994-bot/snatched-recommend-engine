@@ -2064,7 +2064,21 @@ def dashboard_approve():
         for row in ws_inv.iter_rows(min_row=2):
             if row[n_col - 1].value == item['name']:
                 old_stock = row[s_col - 1].value or 0
-                row[s_col - 1].value = max(0, old_stock - 1)
+                # Stock is only ever checked at PICK time (manual_pick, swap),
+                # never re-checked here at approve time -- so two different
+                # customers can both end up with the same last-1-in-stock
+                # product sitting Pending at once (nothing reserves it when
+                # picked, only Approve actually decrements). Without this
+                # check, the second Approve would silently clamp to 0 and
+                # mark her box ready-to-ship for a product that doesn't
+                # physically exist anymore. Refuse instead, same as
+                # manual_pick already refuses to pick something with 0 stock.
+                if old_stock < 1:
+                    return jsonify({
+                        'error': f'"{item["name"]}" is out of stock right now (someone else likely got the last one approved first). '
+                                 f'Swap or pick a different product for this slot before approving.',
+                    }), 409
+                row[s_col - 1].value = old_stock - 1
                 updated = True
                 break
         if not updated:
