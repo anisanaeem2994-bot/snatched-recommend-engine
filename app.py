@@ -34,6 +34,7 @@ from functools import wraps
 
 import requests
 import base64 as base64_lib
+import threading
 
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 GITHUB_REPO = 'anisanaeem2994-bot/snatched-recommend-engine'
@@ -72,6 +73,21 @@ def push_to_github():
         print(f'GitHub push error: {e}', flush=True)
         return False
 
+def push_to_github_async():
+    """Fire-and-forget wrapper around push_to_github(). The real function
+    makes two real network calls to GitHub's API (a GET then a PUT), each
+    with its own timeout (15s + 30s) -- if GitHub is slow, or the token
+    is bad and every retry/redirect eats time, that's up to ~45+ seconds
+    the dashboard would otherwise sit there waiting on before the person
+    using it sees ANYTHING happen, even though their change already saved
+    successfully to local disk moments earlier. Every write endpoint below
+    already calls wb.save(recommend_v5.path) synchronously first -- the
+    actual data is safe on disk before this even starts -- so there's no
+    reason the browser needs to wait on the GitHub backup part too. This
+    runs it on a background thread instead, so the response comes back
+    immediately regardless of how long (or whether) GitHub cooperates."""
+    threading.Thread(target=push_to_github, daemon=True).start()
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
@@ -97,7 +113,7 @@ DASHBOARD_LOGIN_HTML = """<!DOCTYPE html>
 </style></head>
 <body>
   <div class="box">
-    <h1>🌸 Snatched Beauty Box</h1>
+    <h1>💄 Snatched Beauty Box</h1>
     <!--ERROR-->
     <form method="POST" action="/dashboard/do_login">
       <input type="password" name="password" placeholder="Password" autofocus required>
@@ -329,7 +345,7 @@ def dashboard_set_customer_status():
             return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'customer_id': customer_id, 'status': new_status})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -391,7 +407,7 @@ def dashboard_cancel_box():
 
         box_row[4].value = 'Cancelled'
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({
             'success': True,
             'box_id': box_id,
@@ -443,7 +459,7 @@ def dashboard_block_brand():
         target_month = recommend_v5.TARGET_MONTH or ''
         ws.append([customer_id, brand, reason, target_month, customer_name])
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'brand': brand})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -473,7 +489,7 @@ def dashboard_unblock_brand():
             ws.delete_rows(r, 1)
 
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'removed': len(rows_to_delete)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -505,7 +521,7 @@ def dashboard_set_customer_notes():
             return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'notes': notes})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -558,7 +574,7 @@ def dashboard_edit_customer():
             return jsonify({'error': 'No editable fields were sent.'}), 400
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'customer_id': customer_id, 'updated': updated_fields})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -655,7 +671,7 @@ def dashboard_edit_preferences():
             return jsonify({'error': 'No preference fields were sent.'}), 400
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'customer_id': customer_id, 'updated': updated})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -749,7 +765,7 @@ def approve_item_endpoint():
             return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
 
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -790,7 +806,7 @@ def unapprove_item_endpoint():
             return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
 
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1114,7 +1130,7 @@ def finalize_item_endpoint():
         ws_items.append([f'BI{next_item_num:05d}', customer_name, customer_id, target_month, box_type, box_id, product_name])
 
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'item_added': product_name, 'box_id': box_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1140,7 +1156,7 @@ def create_box_record_endpoint():
         ws_boxes.append([box_id, customer_id, customer_name, target_month, 'sent', box_type])
 
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'box_id': box_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1344,7 +1360,7 @@ def dashboard_generate_month():
             built += 1
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({
             'success': True, 'target_month': target_month, 'customers_built': built,
             'skipped': skipped,
@@ -1426,7 +1442,7 @@ def dashboard_generate_for_customer():
                        why_text, 'Pending', False, p.get('retail_price_aed')])
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True, 'customer_name': c['name'], 'target_month': target_month})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1580,20 +1596,80 @@ def dashboard_all_customers():
 @app.route('/dashboard/inventory', methods=['GET'])
 @dashboard_login_required
 def dashboard_inventory():
-    """Real, in-stock inventory — powers the 'Enter my own' search box.
-    Only ever returns items with stock > 0, same rule the manual-pick
-    endpoint itself enforces."""
+    """Powers two different things depending on the 'all' flag:
+    - Default (no flag): only items with stock > 0 -- this is what the
+      'Enter my own' manual-pick search box uses, same rule the manual-pick
+      endpoint itself enforces (can't hand-pick something that's out of stock).
+    - all=1: every product regardless of stock, including 0 -- this is what
+      the 'Current inventory' browse/check panel uses, so Iqra can see
+      out-of-stock items too and confirm counts after a restock."""
     try:
         importlib.reload(recommend_v5)
         inv = recommend_v5.load_inventory()
+        show_all = request.args.get('all') == '1'
         items = [
             {'name': p['name'], 'category': p['category'], 'tier': p['tier'],
              'stock': p['stock'], 'price': p.get('retail_price_aed')}
-            for p in inv if (p['stock'] or 0) > 0
+            for p in inv if show_all or (p['stock'] or 0) > 0
         ]
-        return jsonify({'items': items})
+        items.sort(key=lambda x: (x['name'] or '').lower())
+        return jsonify({'items': items, 'count': len(items)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+def _apply_inventory_change(wb, ws, name, qty, category='', tier='', price_raw=None):
+    """Core add-or-restock logic, shared by the single-item and bulk-upload
+    endpoints. If `name` already exists in the inventory sheet (exact match,
+    case-insensitive), its stock_qty is just increased by `qty` -- this is
+    the normal 'restocking' case. If it's a brand-new product, a new row is
+    created with a freshly-generated product_id, continuing the same
+    NEW#### numbering already used for hand-added products in this sheet.
+    Returns a result dict; does NOT save the workbook or push to GitHub --
+    callers do that once, after all rows for a batch are applied, so a
+    100-item bulk upload doesn't save/push 100 separate times."""
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    n_col = headers.index('name') + 1
+    s_col = headers.index('stock_qty') + 1
+    id_col = headers.index('product_id') + 1
+    cat_col = headers.index('category') + 1
+    tier_col = headers.index('tier') + 1
+    price_col = headers.index('retail_price_aed') + 1
+
+    name_lower = name.lower()
+    max_num = 0
+    for r in range(2, ws.max_row + 1):
+        pid = ws.cell(r, id_col).value
+        existing_name = ws.cell(r, n_col).value
+        if pid:
+            digits = ''.join(ch for ch in str(pid) if ch.isdigit())
+            if digits:
+                max_num = max(max_num, int(digits))
+        if existing_name and str(existing_name).strip().lower() == name_lower:
+            old_stock = ws.cell(r, s_col).value or 0
+            new_stock = old_stock + qty
+            ws.cell(r, s_col).value = new_stock
+            return {
+                'success': True, 'created_new': False, 'name': existing_name,
+                'old_stock': old_stock, 'new_stock': new_stock,
+            }
+
+    new_id = f'NEW{max_num + 1:04d}'
+    new_row_num = _next_append_row(ws, check_cols=(id_col, n_col))
+    ws.cell(new_row_num, id_col).value = new_id
+    ws.cell(new_row_num, n_col).value = name
+    ws.cell(new_row_num, tier_col).value = tier
+    ws.cell(new_row_num, cat_col).value = category
+    ws.cell(new_row_num, s_col).value = qty
+    if price_raw:
+        try:
+            ws.cell(new_row_num, price_col).value = float(price_raw)
+        except ValueError:
+            pass
+
+    return {
+        'success': True, 'created_new': True, 'product_id': new_id,
+        'name': name, 'old_stock': 0, 'new_stock': qty,
+    }
 
 @app.route('/dashboard/add_inventory', methods=['POST'])
 @dashboard_login_required
@@ -1601,9 +1677,8 @@ def dashboard_add_inventory():
     """Lets Iqra add new stock straight from the dashboard -- no
     spreadsheet needed. If the product name already exists (exact match,
     case-insensitive), its stock_qty is just increased by the amount
-    given. If it's a brand-new product, a new inventory row is created
-    with a freshly-generated product_id, continuing the same NEW####
-    numbering already used for hand-added products in this sheet."""
+    given -- this is how restocking an item she already carries works,
+    same as adding a brand-new one. See _apply_inventory_change()."""
     name = (request.form.get('name') or '').strip()
     qty_raw = request.form.get('quantity')
     category = (request.form.get('category') or '').strip()
@@ -1623,51 +1698,75 @@ def dashboard_add_inventory():
         importlib.reload(recommend_v5)
         wb = recommend_v5.wb
         ws = wb['inventory']
-        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        n_col = headers.index('name') + 1
-        s_col = headers.index('stock_qty') + 1
-        id_col = headers.index('product_id') + 1
-        cat_col = headers.index('category') + 1
-        tier_col = headers.index('tier') + 1
-        price_col = headers.index('retail_price_aed') + 1
-
-        name_lower = name.lower()
-        max_num = 0
-        for r in range(2, ws.max_row + 1):
-            pid = ws.cell(r, id_col).value
-            existing_name = ws.cell(r, n_col).value
-            if pid:
-                digits = ''.join(ch for ch in str(pid) if ch.isdigit())
-                if digits:
-                    max_num = max(max_num, int(digits))
-            if existing_name and str(existing_name).strip().lower() == name_lower:
-                new_stock = (ws.cell(r, s_col).value or 0) + qty
-                ws.cell(r, s_col).value = new_stock
-                wb.save(recommend_v5.path)
-                push_to_github()
-                return jsonify({
-                    'success': True, 'created_new': False, 'name': existing_name,
-                    'new_stock': new_stock,
-                })
-
-        new_id = f'NEW{max_num + 1:04d}'
-        new_row_num = _next_append_row(ws, check_cols=(id_col, n_col))
-        ws.cell(new_row_num, id_col).value = new_id
-        ws.cell(new_row_num, n_col).value = name
-        ws.cell(new_row_num, tier_col).value = tier
-        ws.cell(new_row_num, cat_col).value = category
-        ws.cell(new_row_num, s_col).value = qty
-        if price_raw:
-            try:
-                ws.cell(new_row_num, price_col).value = float(price_raw)
-            except ValueError:
-                pass
-
+        result = _apply_inventory_change(wb, ws, name, qty, category, tier, price_raw)
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/bulk_add_inventory', methods=['POST'])
+@dashboard_login_required
+def dashboard_bulk_add_inventory():
+    """Lets Iqra paste in a whole restock list at once instead of adding
+    100 items one at a time. Expects a 'lines' form field, one product per
+    line, formatted as:  Name, Quantity[, Category, Tier]
+    (Category/Tier only matter for brand-new products; existing products
+    just get restocked by name match.) Blank lines and lines starting with
+    # are ignored. Every valid line is applied to the same in-memory
+    workbook, then it's saved and pushed to GitHub exactly once."""
+    raw = request.form.get('lines') or ''
+    raw_lines = [ln.strip() for ln in raw.splitlines()]
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws = wb['inventory']
+
+        created, restocked, errors = [], [], []
+        any_applied = False
+        for i, line in enumerate(raw_lines, start=1):
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 2:
+                errors.append({'line': i, 'text': line, 'reason': 'Expected "Name, Quantity" — no comma found.'})
+                continue
+            name = parts[0]
+            qty_raw = parts[1]
+            category = parts[2] if len(parts) > 2 else ''
+            tier = parts[3] if len(parts) > 3 else ''
+            if not name:
+                errors.append({'line': i, 'text': line, 'reason': 'Missing product name.'})
+                continue
+            try:
+                qty = int(qty_raw)
+            except ValueError:
+                errors.append({'line': i, 'text': line, 'reason': f'"{qty_raw}" is not a whole number.'})
+                continue
+            if qty <= 0:
+                errors.append({'line': i, 'text': line, 'reason': 'Quantity must be greater than 0.'})
+                continue
+
+            result = _apply_inventory_change(wb, ws, name, qty, category, tier)
+            any_applied = True
+            if result['created_new']:
+                created.append(result)
+            else:
+                restocked.append(result)
+
+        if any_applied:
+            wb.save(recommend_v5.path)
+            push_to_github_async()
+
         return jsonify({
-            'success': True, 'created_new': True, 'product_id': new_id,
-            'name': name, 'new_stock': qty,
+            'success': True,
+            'created': created,
+            'restocked': restocked,
+            'errors': errors,
+            'created_count': len(created),
+            'restocked_count': len(restocked),
+            'error_count': len(errors),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1753,7 +1852,7 @@ def dashboard_swap():
         _write_item_row(ws, row_number, product,
                          'Owner-requested swap — next best match for her preferences, timing, and brand rules.')
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
         return jsonify({'found': True, 'item': updated})
     except Exception as e:
@@ -1795,9 +1894,72 @@ def dashboard_swap_category():
         _write_item_row(ws, row_number, product,
                          f'Owner-requested category change — swapped from "{old_category}" to "{new_category}".')
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
         return jsonify({'found': True, 'item': updated, 'old_category': old_category, 'new_category': new_category})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/eligible_products', methods=['GET'])
+@dashboard_login_required
+def dashboard_eligible_products():
+    """Powers the 'Enter my own' picker list. Given a row_number, returns
+    every real, in-stock product that matches the customer's tier (for a
+    Mixed box, that means both Essentials and Prestige, since that's what
+    her box actually draws from) -- NOT the whole catalog.
+
+    Products from a brand she has strictly blocked are NOT removed from
+    this list -- Iqra asked for them to still be visible but clearly
+    flagged, so she can see at a glance what NOT to pick rather than
+    wondering why something is missing. The automatic recommend/swap
+    engine (recommend_v5.recommend, find_alternative) already hard-excludes
+    blocked brands on its own and always has -- this list is a manual
+    override tool, so it warns instead of hiding."""
+    row_number = request.args.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(row_number)
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        block, item = _find_item_row_context(ws, row_number)
+        if not item:
+            return jsonify({'error': f'No item found at row {row_number}.'}), 404
+
+        customers = recommend_v5.load_customers()
+        cust = next((c for c in customers.values() if c['name'] == block['customer_name']), None)
+        box_type = cust['box_type'] if cust else None
+        ratio = recommend_v5.BOX_RATIOS.get(box_type)
+        eligible_tiers = set(ratio.keys()) if ratio else ({box_type} if box_type else set())
+
+        blocked_brands = recommend_v5.load_blocked_brands().get(cust['id'], set()) if cust else set()
+        current_names_lower = {i['name'].strip().lower() for i in block['items']}
+
+        inventory = recommend_v5.load_inventory()
+        items = []
+        for p in inventory:
+            if (p['stock'] or 0) <= 0:
+                continue
+            if eligible_tiers and p['tier'] not in eligible_tiers:
+                continue
+            brand = recommend_v5.get_brand(p['name'])
+            items.append({
+                'name': p['name'], 'category': p['category'], 'tier': p['tier'],
+                'stock': p['stock'], 'price': p.get('retail_price_aed'),
+                'brand': brand,
+                'blocked': brand in blocked_brands,
+                'in_box': p['name'].strip().lower() in current_names_lower,
+            })
+        items.sort(key=lambda x: (x['category'] or '', x['name'] or ''))
+
+        return jsonify({
+            'items': items,
+            'total': len(items),
+            'blocked_count': sum(1 for i in items if i['blocked']),
+            'box_type': box_type,
+            'eligible_tiers': sorted(eligible_tiers),
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1848,7 +2010,7 @@ def dashboard_manual_pick():
                          'Owner-selected manually — chosen directly instead of an engine suggestion.',
                          manual=True)
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
 
         updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
         return jsonify({'success': True, 'item': updated, 'brand_clash': brand_clash, 'repeat': repeat, 'blocked': blocked, 'brand': new_brand})
@@ -1891,7 +2053,7 @@ def dashboard_approve():
 
         ws.cell(row_number, 7).value = 'Approved'
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1925,7 +2087,7 @@ def dashboard_unapprove():
 
         ws.cell(row_number, 7).value = 'Pending'
         recommend_v5.wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2004,7 +2166,7 @@ def dashboard_commit_month():
             ws.delete_rows(r, 1)
 
         wb.save(recommend_v5.path)
-        push_to_github()
+        push_to_github_async()
         return jsonify({
             'success': True,
             'target_month': target_month,

@@ -154,6 +154,17 @@
 
   .tag-group{ display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; }
   .tag{ background:#f5eef2; color:var(--pink-dark); font-size:11.8px; font-weight:600; padding:5px 11px; border-radius:999px; }
+  .tag.often{ background:var(--green-bg); color:#2f7350; }
+  .tag.sometimes{ background:#f5eef2; color:var(--pink-dark); }
+  .tag.rarely{ background:#f2f0f8; color:var(--purple-dark); }
+
+  .compact-summary .section-label{ font-size:11.5px; font-weight:700; color:var(--pink-dark); text-transform:uppercase; letter-spacing:.03em; margin:16px 0 6px; }
+  .compact-summary .compact-line{ font-size:13.3px; line-height:1.55; margin-bottom:6px; }
+  .compact-summary .compact-line .lbl{ color:var(--muted); font-weight:600; }
+  .btn-edit-toggle{ background:#fff; color:var(--purple-dark); border:1px solid var(--purple); padding:6px 13px; border-radius:8px; font-size:12px; font-weight:700; cursor:pointer; }
+  .btn-edit-toggle:hover{ background:#f2f0f8; }
+  .prefs-edit-zone{ display:none; margin-top:14px; padding-top:14px; border-top:1px dashed var(--line); }
+  .prefs-edit-zone.open{ display:block; }
 
   .check-box{ background:#fbf2f6; border:1.5px dashed var(--pink); border-radius:12px; padding:16px 18px; margin:18px 0; }
   .check-box label{ font-size:13px; font-weight:700; display:block; margin-bottom:8px; }
@@ -189,11 +200,17 @@
   .manual-panel.open{ display:block; }
   .manual-panel input{ width:100%; padding:9px 12px; border-radius:8px; border:1px solid var(--line); font-size:13px; outline:none; margin-bottom:8px;}
   .manual-panel input:focus{ border-color:var(--purple); }
-  .manual-results{ max-height:220px; overflow-y:auto; }
-  .manual-result{ display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-radius:8px; font-size:12.5px; cursor:pointer; }
+  .manual-info{ font-size:11.5px; color:var(--purple-dark); background:#ece7f7; padding:7px 11px; border-radius:8px; margin-bottom:8px; line-height:1.5; }
+  .manual-results{ max-height:280px; overflow-y:auto; }
+  .manual-cat-label{ font-size:10.8px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; padding:7px 6px 3px; position:sticky; top:0; background:#f7f5fb; }
+  .manual-result{ display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-radius:8px; font-size:12.5px; cursor:pointer; gap:8px; }
   .manual-result:hover{ background:#ece7f7; }
+  .manual-result.in-box{ background:var(--green-bg); }
+  .manual-result.blocked{ background:var(--red-bg); }
   .manual-result .mr-name{ font-weight:600; }
-  .manual-result .mr-meta{ color:var(--muted); font-size:11.5px; }
+  .manual-result .mr-meta{ color:var(--muted); font-size:11.5px; white-space:nowrap; }
+  .mr-blocked-tag{ color:var(--red); font-weight:700; font-size:11.3px; white-space:nowrap; }
+  .mr-inbox-tag{ color:var(--green); font-weight:700; font-size:11.3px; white-space:nowrap; }
   .manual-warning{ background:var(--amber-bg); color:var(--amber); font-size:11.8px; font-weight:600; padding:8px 12px; border-radius:8px; margin-top:8px; display:none; }
   .manual-warning.show{ display:block; }
   .manual-ok{ background:var(--green-bg); color:var(--green); font-size:11.8px; font-weight:600; padding:8px 12px; border-radius:8px; margin-top:8px; display:none; }
@@ -292,7 +309,7 @@
 
     <div class="panel">
       <h3>📦 Add inventory</h3>
-      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Type a product name. If it already exists, this just adds to its current stock count — if it's brand new, it creates the product for you. No spreadsheet needed.</div>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Type a product name. If it already exists, this <b>restocks it</b> — adds to whatever count it already has. If it's brand new, it creates the product for you. No spreadsheet needed.</div>
       <div class="row-line" style="gap:8px;flex-wrap:wrap;align-items:flex-start;">
         <input id="addInvName" list="addInvNameList" placeholder="Product name…" style="flex:2;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
         <datalist id="addInvNameList"></datalist>
@@ -314,6 +331,27 @@
         <button class="btn btn-approve" onclick="addInventory()">Add to inventory</button>
       </div>
       <div class="empty-note" id="addInvResult" style="display:none;"></div>
+
+      <div style="margin-top:16px;padding-top:14px;border-top:1px dashed var(--line);">
+        <div style="font-size:13px;font-weight:700;margin-bottom:4px;">Got a whole restock list at once?</div>
+        <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Paste the whole list in — one product per line, like <code>Lip Gloss Pink, 12</code>. Existing products get restocked, new ones get created, all in one go.</div>
+        <textarea id="bulkInvLines" rows="5" placeholder="Lip Gloss Pink, 12&#10;Setting Powder, 8&#10;Brand New Blush, 20, Face, Essentials" style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;font-family:inherit;resize:vertical;"></textarea>
+        <div class="row-line" style="gap:8px;margin-top:8px;">
+          <button class="btn btn-approve" onclick="bulkAddInventory()">Upload list</button>
+        </div>
+        <div id="bulkInvResult" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>📋 Current inventory</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Every product and exactly how many are in stock right now — so you can double-check a restock actually went through.</div>
+      <div class="row-line" style="gap:8px;flex-wrap:wrap;">
+        <input id="invViewSearch" placeholder="Search a product name…" oninput="renderInvView()" style="flex:1;min-width:180px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <button class="btn btn-outline" onclick="refreshInvView()">Refresh</button>
+      </div>
+      <div id="invViewCount" style="font-size:11.5px;color:var(--muted);margin:8px 0;"></div>
+      <div id="invViewTable" style="max-height:340px;overflow-y:auto;"></div>
     </div>
 
     <div class="panel">
@@ -571,7 +609,8 @@ function renderItemRow(it){
         }
       </div>
       <div class="manual-panel" id="manual-${rk}">
-        <input placeholder="Type any product name — searches real, in-stock inventory only…" oninput="filterManual(${it.row_number}, this.value)">
+        <div class="manual-info" id="manualInfo-${rk}">Loading her eligible products…</div>
+        <input placeholder="Filter this list by name… (optional — full list already shown below)" oninput="filterManualList(${it.row_number}, this.value)">
         <div class="manual-results" id="manualResults-${rk}"></div>
         <div class="manual-warning" id="manualWarn-${rk}"></div>
         <div class="manual-ok" id="manualOk-${rk}"></div>
@@ -673,7 +712,65 @@ async function addInventory(){
     document.getElementById('addInvQty').value = 1;
     inventoryCatalog = null; // force a refresh so this shows up next time it's used
     ensureInventory();
+    refreshInvView();
   }catch(e){ alert('Could not add inventory: ' + e.message); }
+}
+
+async function bulkAddInventory(){
+  const el = document.getElementById('bulkInvLines');
+  const lines = el.value;
+  const resultEl = document.getElementById('bulkInvResult');
+  if(!lines.trim()){ alert('Paste in a list first — one product per line.'); return; }
+  try{
+    const data = await postForm('/dashboard/bulk_add_inventory', { lines });
+    if(!data || data.error){ alert('Could not upload list: ' + ((data && data.error) || 'unknown error')); return; }
+    let html = `<div style="font-size:12.5px;font-weight:700;color:var(--green);">✔ ${data.restocked_count} restocked, ${data.created_count} new product${data.created_count===1?'':'s'} created</div>`;
+    if(data.restocked.length){
+      html += `<div style="margin-top:6px;font-size:11.5px;">${data.restocked.map(r=>`${r.name}: ${r.old_stock} → <b>${r.new_stock}</b>`).join('<br>')}</div>`;
+    }
+    if(data.created.length){
+      html += `<div style="margin-top:6px;font-size:11.5px;">New: ${data.created.map(r=>`${r.name} (${r.new_stock} in stock)`).join(', ')}</div>`;
+    }
+    if(data.errors.length){
+      html += `<div style="margin-top:8px;font-size:11.5px;color:var(--red);">⚠ ${data.errors.length} line${data.errors.length===1?'':'s'} skipped:<br>${data.errors.map(e=>`Line ${e.line}: "${e.text}" — ${e.reason}`).join('<br>')}</div>`;
+    }
+    resultEl.innerHTML = html;
+    if(!data.errors.length) el.value = '';
+    inventoryCatalog = null;
+    ensureInventory();
+    refreshInvView();
+  }catch(e){ alert('Could not upload list: ' + e.message); }
+}
+
+let invViewData = null;
+async function refreshInvView(){
+  try{
+    const data = await api('/dashboard/inventory?all=1');
+    invViewData = (data && data.items) || [];
+    renderInvView();
+  }catch(e){
+    document.getElementById('invViewTable').innerHTML = `<div class="empty-note">Couldn't load inventory: ${e.message}</div>`;
+  }
+}
+function renderInvView(){
+  const tableEl = document.getElementById('invViewTable');
+  const countEl = document.getElementById('invViewCount');
+  if(!invViewData){ tableEl.innerHTML = '<div class="empty-note">Loading…</div>'; return; }
+  const q = (document.getElementById('invViewSearch').value || '').trim().toLowerCase();
+  const rows = invViewData.filter(p => !q || (p.name||'').toLowerCase().includes(q));
+  countEl.textContent = `${rows.length} of ${invViewData.length} products shown`;
+  if(!rows.length){ tableEl.innerHTML = '<div class="empty-note">No products match that search.</div>'; return; }
+  tableEl.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+    <thead><tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--line);">
+      <th style="padding:6px 4px;">Product</th><th style="padding:6px 4px;">Category</th><th style="padding:6px 4px;">Tier</th><th style="padding:6px 4px;text-align:right;">Stock</th>
+    </tr></thead>
+    <tbody>${rows.map(p => `<tr style="border-bottom:1px solid var(--line);${(p.stock||0)===0?'color:var(--red);':''}">
+      <td style="padding:6px 4px;">${p.name||''}</td>
+      <td style="padding:6px 4px;">${p.category||''}</td>
+      <td style="padding:6px 4px;">${p.tier||''}</td>
+      <td style="padding:6px 4px;text-align:right;font-weight:700;">${p.stock||0}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
 }
 
 async function doSwap(rowNumber){
@@ -724,39 +821,65 @@ async function tryCommit(){
 
 /* ---------------- manual "enter my own" ---------------- */
 let openManualRowKey = null;
+const manualCatalogCache = {}; // rowKey -> {items, total, blocked_count, box_type}
 
 async function toggleManual(rowNumber){
-  await ensureInventory();
   const rk = rowKey(rowNumber);
   const panel = document.getElementById('manual-'+rk);
   const wasOpen = panel.classList.contains('open');
   document.querySelectorAll('.manual-panel.open').forEach(p=>p.classList.remove('open'));
-  if(!wasOpen){ panel.classList.add('open'); panel.querySelector('input').focus(); openManualRowKey = rk; }
-  else { openManualRowKey = null; }
+  if(wasOpen){ openManualRowKey = null; return; }
+  panel.classList.add('open');
+  openManualRowKey = rk;
+  await loadManualCatalog(rowNumber);
 }
 
-function getBrandGuess(name){
-  // lightweight client-side guess just for showing a friendly label in results;
-  // the real brand-duplicate check happens server-side in /dashboard/manual_pick
-  return name.split(' ')[0];
+async function loadManualCatalog(rowNumber){
+  const rk = rowKey(rowNumber);
+  const infoEl = document.getElementById('manualInfo-'+rk);
+  infoEl.textContent = 'Loading her eligible products…';
+  try{
+    const data = await api('/dashboard/eligible_products?row_number=' + rowNumber);
+    if(!data || data.error){ infoEl.textContent = 'Could not load her product list: ' + ((data && data.error) || 'unknown error'); return; }
+    manualCatalogCache[rk] = data;
+    const tierLabel = (data.eligible_tiers||[]).join(' + ') || data.box_type || 'her tier';
+    infoEl.innerHTML = `📋 <b>${data.total} products</b> match her <b>${data.box_type||'—'}</b> tier (${tierLabel}) · ` +
+      (data.blocked_count
+        ? `<span style="color:var(--red);font-weight:700;">${data.blocked_count} flagged below — she doesn't want that brand.</span>`
+        : `<b>0 excluded</b> — no brands blocked for her right now.`);
+    document.querySelector(`#manual-${rk} input`).value = '';
+    renderManualList(rowNumber, '');
+  }catch(e){ infoEl.textContent = 'Could not load her product list: ' + e.message; }
 }
 
-async function filterManual(rowNumber, val){
+function renderManualList(rowNumber, filterText){
   const rk = rowKey(rowNumber);
   const resultsEl = document.getElementById('manualResults-'+rk);
-  document.getElementById('manualWarn-'+rk).classList.remove('show');
-  document.getElementById('manualOk-'+rk).classList.remove('show');
-  if(val.trim().length < 2){ resultsEl.innerHTML=''; return; }
-  const inv = await ensureInventory();
-  const q = val.toLowerCase();
-  const matches = inv.filter(p=>p.name.toLowerCase().includes(q)).slice(0,8);
-  resultsEl.innerHTML = matches.length
-    ? matches.map(p=>`
-        <div class="manual-result" onclick='selectManual(${rowNumber}, ${JSON.stringify(p.name)})'>
-          <span class="mr-name">${p.name}</span>
-          <span class="mr-meta">${p.category} · ${p.tier} · AED ${p.price} · stock ${p.stock}</span>
-        </div>`).join('')
-    : `<div class="mr-meta" style="padding:8px 10px;">No in-stock product matches "${val}".</div>`;
+  const cached = manualCatalogCache[rk];
+  if(!cached){ resultsEl.innerHTML = ''; return; }
+  const q = (filterText||'').trim().toLowerCase();
+  const items = q ? cached.items.filter(p=>p.name.toLowerCase().includes(q)) : cached.items;
+  if(!items.length){ resultsEl.innerHTML = `<div class="mr-meta" style="padding:8px 10px;">No product matches "${filterText}".</div>`; return; }
+
+  let html = '';
+  let lastCat = null;
+  items.forEach(p=>{
+    if(p.category !== lastCat){ html += `<div class="manual-cat-label">${p.category||'Other'}</div>`; lastCat = p.category; }
+    const cls = p.in_box ? 'in-box' : (p.blocked ? 'blocked' : '');
+    const tag = p.in_box
+      ? `<span class="mr-inbox-tag">✓ currently in box</span>`
+      : (p.blocked
+          ? `<span class="mr-blocked-tag">⚠ she doesn't want this — ${p.brand}</span>`
+          : `<span class="mr-meta">${p.tier} · AED ${p.price} · stock ${p.stock}</span>`);
+    html += `<div class="manual-result ${cls}" onclick='selectManual(${rowNumber}, ${JSON.stringify(p.name)})'>
+        <span class="mr-name">${p.name}</span>${tag}
+      </div>`;
+  });
+  resultsEl.innerHTML = html;
+}
+
+function filterManualList(rowNumber, val){
+  renderManualList(rowNumber, val);
 }
 
 async function selectManual(rowNumber, productName){
@@ -767,17 +890,13 @@ async function selectManual(rowNumber, productName){
     if(!res) return;
     if(res.error){ alert(res.error); return; }
     await loadBoard();
-    setTimeout(()=>{
+    setTimeout(async ()=>{
       const panel = document.getElementById('manual-'+rk);
       if(panel) panel.classList.add('open');
-      const resultsEl = document.getElementById('manualResults-'+rk);
+      openManualRowKey = rk;
+      await loadManualCatalog(rowNumber); // refresh so "currently in box" tag moves to the new pick
       const warnEl = document.getElementById('manualWarn-'+rk);
       const okEl = document.getElementById('manualOk-'+rk);
-      const inputEl = document.querySelector(`#manual-${rk} input`);
-      if(inputEl) inputEl.value = '';
-      if(resultsEl){
-        resultsEl.innerHTML = `<div class="mr-meta" style="padding:8px 10px; font-weight:700; color:var(--purple-dark);">✓ Selected "${productName}" — the item above is now updated. <span style="text-decoration:underline;cursor:pointer;" onclick="document.querySelector('#manual-${rk} input').focus()">Search a different product</span></div>`;
-      }
       let msgs = [];
       if(res.blocked) msgs.push(`⚠️ You blocked ${res.brand} for this customer — double-check before sending.`);
       if(res.brand_clash) msgs.push(`Heads up — she already has another ${res.brand} product elsewhere in this box.`);
@@ -825,7 +944,13 @@ function labelize(k){
 async function renderProfileInto(targetId, name){
   const area = document.getElementById(targetId);
   area.innerHTML = `<div class="empty-note">Loading…</div>`;
-  const data = await api('/customer_lookup?name=' + encodeURIComponent(name));
+  let data;
+  try{
+    data = await api('/customer_lookup?name=' + encodeURIComponent(name));
+  }catch(e){
+    area.innerHTML = `<div class="empty-note">Couldn't load her profile: ${e.message}. <a href="#" onclick="renderProfileInto('${targetId}','${name.replace(/'/g,"\\'")}');return false;">Try again</a></div>`;
+    return;
+  }
   if(!data || data.error){
     area.innerHTML = `<div class="empty-note">${(data && data.error) || 'No customer found named "'+name+'".'}</div>`;
     return;
@@ -963,40 +1088,83 @@ async function renderProfileInto(targetId, name){
       <textarea id="notesArea-${targetId}" rows="3" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;">${data.notes || ''}</textarea>
       <div style="margin-top:6px;"><button class="btn btn-swap" onclick="saveNotes('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save notes</button></div>
 
-      <h3 style="margin-top:18px;">Edit preferences &amp; quiz answers</h3>
-      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Fix anything below yourself — a quiz answer that came in wrong, or how often she really wants a category. Saved changes apply to her next box automatically.</div>
+      <div class="profile-head" style="margin-top:18px;margin-bottom:0;align-items:center;">
+        <h3 style="margin:0;">Preferences &amp; quiz answers</h3>
+        <button class="btn-edit-toggle" onclick="document.getElementById('prefsEditZone-${targetId}').classList.toggle('open')">✎ Edit</button>
+      </div>
 
-      ${Object.keys(data.frequencies||{}).length ? `
-      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:10px 0 4px;">How often she wants each category</div>
-      ${Object.entries(data.frequencies).map(([cat, level]) => `
-        <div class="row-line">
-          <span>${labelize(cat)}</span>
-          <select id="editFreq-${targetId}-${cat}" data-cat="${cat}" class="edit-freq-select" style="padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;">
-            <option value="Often" ${level==='Often'?'selected':''}>Often</option>
-            <option value="Sometimes" ${level==='Sometimes'?'selected':''}>Sometimes</option>
-            <option value="Rarely" ${level==='Rarely'?'selected':''}>Rarely</option>
-          </select>
+      <div class="compact-summary">
+        ${(data.quiz && (data.quiz.skin_tone||data.quiz.eye_color||data.quiz.hair_color||data.quiz.makeup_comfort)) ? `
+        <div class="section-label">Quiz basics</div>
+        <div class="compact-line">
+          ${[
+            data.quiz.skin_tone ? `<span class="lbl">Skin tone</span> ${data.quiz.skin_tone}` : '',
+            data.quiz.eye_color ? `<span class="lbl">Eyes</span> ${data.quiz.eye_color}` : '',
+            data.quiz.hair_color ? `<span class="lbl">Hair</span> ${data.quiz.hair_color}` : '',
+            data.quiz.makeup_comfort ? `<span class="lbl">Comfort with makeup</span> ${data.quiz.makeup_comfort}` : '',
+          ].filter(Boolean).join(' &nbsp;·&nbsp; ')}
         </div>
-      `).join('')}
-      ` : ''}
+        ` : ''}
 
-      ${data.preferences && Object.keys(data.preferences).length ? `
-      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:14px 0 4px;">Style &amp; shopping preferences</div>
-      ${Object.entries(data.preferences).map(([k,v]) => `
-        <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;">${labelize(k)}
-          <input id="editPref-${targetId}-${k}" data-key="${k}" class="edit-pref-input" value="${((Array.isArray(v)?v:[v]).filter(Boolean).join(', ')).replace(/"/g,'&quot;')}" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:2px;">
-        </label>
-      `).join('')}
-      ` : ''}
+        ${Object.keys(freqGroups).length ? `
+        <div class="section-label">How often she uses things</div>
+        ${freqOrder.filter(l=>freqGroups[l]).map(level => `
+          <div class="compact-line" style="margin-top:8px;"><span class="lbl">${level}:</span></div>
+          <div class="tag-group">${freqGroups[level].map(c=>`<span class="tag ${level.toLowerCase()}">${c}</span>`).join('')}</div>
+        `).join('')}
+        ${extraFreqLevels.map(level => `
+          <div class="compact-line" style="margin-top:8px;"><span class="lbl">${level}:</span></div>
+          <div class="tag-group">${freqGroups[level].map(c=>`<span class="tag">${c}</span>`).join('')}</div>
+        `).join('')}
+        ` : ''}
 
-      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:14px 0 4px;">Quiz answers</div>
-      ${['skin_tone','eye_color','hair_color','makeup_comfort'].map(k => `
-        <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;">${labelize(k)}
-          <input id="editQuiz-${targetId}-${k}" value="${((data.quiz||{})[k] || '').toString().replace(/"/g,'&quot;')}" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:2px;">
-        </label>
-      `).join('')}
+        ${data.preferences && Object.keys(data.preferences).length ? `
+        <div class="section-label">Preferences</div>
+        ${Object.entries(data.preferences).map(([k,v]) => {
+          const vals = (Array.isArray(v)?v:[v]).filter(Boolean).join(', ');
+          return vals ? `<div class="compact-line"><span class="lbl">${labelize(k)}:</span> ${vals}</div>` : '';
+        }).join('')}
+        ` : ''}
 
-      <div style="margin-top:10px;"><button class="btn btn-swap" onclick="savePreferences('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save preference changes</button></div>
+        ${!Object.keys(freqGroups).length && !(data.preferences && Object.keys(data.preferences).length) && !(data.quiz && Object.keys(data.quiz).length)
+          ? '<div class="empty-note" style="padding:8px 0;">No quiz or preference data on file yet.</div>' : ''}
+      </div>
+
+      <div id="prefsEditZone-${targetId}" class="prefs-edit-zone">
+        <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Fix anything below yourself — a quiz answer that came in wrong, or how often she really wants a category. Saved changes apply to her next box automatically.</div>
+
+        ${Object.keys(data.frequencies||{}).length ? `
+        <div style="font-size:12px;font-weight:700;color:var(--muted);margin:10px 0 4px;">How often she wants each category</div>
+        ${Object.entries(data.frequencies).map(([cat, level]) => `
+          <div class="row-line">
+            <span>${labelize(cat)}</span>
+            <select id="editFreq-${targetId}-${cat}" data-cat="${cat}" class="edit-freq-select" style="padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;">
+              <option value="Often" ${level==='Often'?'selected':''}>Often</option>
+              <option value="Sometimes" ${level==='Sometimes'?'selected':''}>Sometimes</option>
+              <option value="Rarely" ${level==='Rarely'?'selected':''}>Rarely</option>
+            </select>
+          </div>
+        `).join('')}
+        ` : ''}
+
+        ${data.preferences && Object.keys(data.preferences).length ? `
+        <div style="font-size:12px;font-weight:700;color:var(--muted);margin:14px 0 4px;">Style &amp; shopping preferences</div>
+        ${Object.entries(data.preferences).map(([k,v]) => `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;">${labelize(k)}
+            <input id="editPref-${targetId}-${k}" data-key="${k}" class="edit-pref-input" value="${((Array.isArray(v)?v:[v]).filter(Boolean).join(', ')).replace(/"/g,'&quot;')}" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:2px;">
+          </label>
+        `).join('')}
+        ` : ''}
+
+        <div style="font-size:12px;font-weight:700;color:var(--muted);margin:14px 0 4px;">Quiz answers</div>
+        ${['skin_tone','eye_color','hair_color','makeup_comfort'].map(k => `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;">${labelize(k)}
+            <input id="editQuiz-${targetId}-${k}" value="${((data.quiz||{})[k] || '').toString().replace(/"/g,'&quot;')}" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:2px;">
+          </label>
+        `).join('')}
+
+        <div style="margin-top:10px;"><button class="btn btn-swap" onclick="savePreferences('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save preference changes</button></div>
+      </div>
 
       <div class="check-box">
         <label>💬 "Has she received this before?"</label>
@@ -1146,6 +1314,7 @@ async function checkProduct(targetId, customerName){
 /* ---------------- init ---------------- */
 loadBoard();
 ensureInventory();
+refreshInvView();
 loadPastMonths();
 </script>
 
