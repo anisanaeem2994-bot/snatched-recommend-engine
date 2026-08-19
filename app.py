@@ -1316,6 +1316,25 @@ def dashboard_generate_month():
         customers = recommend_v5.load_customers()
         all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
 
+        # Loaded ONCE here instead of once per customer inside the loop below.
+        # None of this changes while the loop runs (nothing in recommend()
+        # writes back to the sheet), so re-reading it fresh for every single
+        # customer was pure wasted time -- with ~15-20 real customers this
+        # was slow enough to blow past Render's 30s worker timeout and crash
+        # the whole request (that's the SystemExit/SIGKILL you saw in the
+        # logs). Reusing one snapshot for everyone fixes that at the root
+        # instead of just asking Render to wait longer.
+        preloaded = {
+            'customers': customers,
+            'box_history': (all_rec, recent_boxes, box_timeline),
+            'prefs': recommend_v5.load_preferences(),
+            'freqs': recommend_v5.load_frequencies(),
+            'quiz': recommend_v5.load_quiz(),
+            'inventory': recommend_v5.load_inventory(),
+            'rejected': recommend_v5.load_rejected_products(),
+            'blocked_brands': recommend_v5.load_blocked_brands(),
+        }
+
         built = 0
         skipped = []
         for cid, cust in customers.items():
@@ -1323,7 +1342,7 @@ def dashboard_generate_month():
             if not due:
                 skipped.append({'name': cust['name'], 'reason': reason})
                 continue
-            out = recommend_v5.recommend(cust['name'])
+            out = recommend_v5.recommend(cust['name'], _preloaded=preloaded)
             if isinstance(out, str):
                 # recommend() returns a plain string instead of raising when
                 # it can't build a box for a real, known reason (e.g. an
@@ -1335,9 +1354,9 @@ def dashboard_generate_month():
             (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
              hist_pat, total, timeline, inv_cat_map, value_summary) = out
 
-            prefs = recommend_v5.load_preferences().get(cid, {})
-            freqs = recommend_v5.load_frequencies().get(cid, {})
-            quiz = recommend_v5.load_quiz().get(cid, {})
+            prefs = preloaded['prefs'].get(cid, {})
+            freqs = preloaded['freqs'].get(cid, {})
+            quiz = preloaded['quiz'].get(cid, {})
             age = ''
             bday = cust.get('birthday')
             if bday:

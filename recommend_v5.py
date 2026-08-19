@@ -5,6 +5,7 @@ Adds: time-gap tracking, history pattern context, all quiz fields
 import openpyxl, sys
 from collections import defaultdict, Counter
 from datetime import datetime
+from functools import lru_cache
 
 # ---- Target-month override ----
 # By default, all "how many months ago" / "is this customer due" calculations
@@ -485,29 +486,45 @@ SKIN_TONE_SHADES = {
     'Deep':   ['deep', 'dark', 'ebony', 'rich'],
 }
 
+# Built once at import time, not per-call -- get_brand() used to rebuild
+# this exact list (and re-lowercase every entry) from scratch on every
+# single invocation, and with hundreds of products checked per customer
+# across ~15-20 customers, that added up to over a million redundant list
+# rebuilds in one Generate Month run. That was slow enough on Render's
+# free-tier CPU to blow past gunicorn's 30s worker timeout and crash the
+# whole request -- the actual root cause of "Generate Month does nothing."
+_KNOWN_BRANDS_LOWER = [b.lower() for b in [
+    'La Roche-Posay', 'Too Faced', 'Charlotte Tilbury', 'Rare Beauty',
+    'Fenty Beauty', 'Fenty Skin', 'Anastasia Beverly Hills',
+    'Urban Decay', 'First Aid Beauty', 'Milk Makeup', 'Makeup By Mario',
+    'Makeup For Ever', 'Cover FX', 'Dr. Dennis Gross', 'Physicians Formula',
+    'Wet n Wild', 'NYX Professional Makeup', 'Some By Mi',
+    'Daily Life Forever', 'Drunk Elephant', 'Beauty of Joseon',
+    'Soap & Glory', 'Pixi by Petra', 'e.l.f.', 'Real Techniques',
+    'Masque Bar', 'NYX', 'Covergirl', 'CoverGirl', 'Maybelline',
+    'Revlon', 'Rimmel', 'Bourjois', 'Essence', 'Marcelle', 'Annabelle',
+    'Eveline', 'Ryshi', 'Danielle Creations', 'Andalou', 'Sukin',
+    'Garnier', 'Biore', 'Eucerin', 'Smashbox', 'Nudestix', 'Tarte',
+    'Huda Beauty', 'MAC', 'Lancôme', 'Giorgio Armani', 'Tom Ford',
+    'NARS', 'Benefit', 'Zoeva', 'Clinique', 'Estée Lauder', 'Laneige',
+    'COSRX', 'Medicube', 'Pixi', 'Sephora', 'Glossier', 'REM Beauty',
+    'Stila', 'GXVE', 'Morphe', 'TIRTIR', 'Kosas', 'Laura Mercier',
+    'Youngblood', 'Hourglass', 'Joah', 'Daylogic', 'Alya Skin',
+]]
+
+@lru_cache(maxsize=4096)
 def get_brand(product_name):
-    known_brands = [
-        'La Roche-Posay', 'Too Faced', 'Charlotte Tilbury', 'Rare Beauty',
-        'Fenty Beauty', 'Fenty Skin', 'Anastasia Beverly Hills',
-        'Urban Decay', 'First Aid Beauty', 'Milk Makeup', 'Makeup By Mario',
-        'Makeup For Ever', 'Cover FX', 'Dr. Dennis Gross', 'Physicians Formula',
-        'Wet n Wild', 'NYX Professional Makeup', 'Some By Mi',
-        'Daily Life Forever', 'Drunk Elephant', 'Beauty of Joseon',
-        'Soap & Glory', 'Pixi by Petra', 'e.l.f.', 'Real Techniques',
-        'Masque Bar', 'NYX', 'Covergirl', 'CoverGirl', 'Maybelline',
-        'Revlon', 'Rimmel', 'Bourjois', 'Essence', 'Marcelle', 'Annabelle',
-        'Eveline', 'Ryshi', 'Danielle Creations', 'Andalou', 'Sukin',
-        'Garnier', 'Biore', 'Eucerin', 'Smashbox', 'Nudestix', 'Tarte',
-        'Huda Beauty', 'MAC', 'Lancôme', 'Giorgio Armani', 'Tom Ford',
-        'NARS', 'Benefit', 'Zoeva', 'Clinique', 'Estée Lauder', 'Laneige',
-        'COSRX', 'Medicube', 'Pixi', 'Sephora', 'Glossier', 'REM Beauty',
-        'Stila', 'GXVE', 'Morphe', 'TIRTIR', 'Kosas', 'Laura Mercier',
-        'Youngblood', 'Hourglass', 'Joah', 'Daylogic', 'Alya Skin',
-    ]
+    # Cached because the same handful of product names get looked up
+    # over and over (once per history comparison, per candidate check,
+    # per customer) -- there are only a few hundred distinct product
+    # names in play at once, so caching turns thousands of repeat
+    # full-list scans into one real scan per unique name. Safe to cache:
+    # this is a pure string->string function with no dependency on the
+    # workbook, so the answer for a given name never changes.
     name_lower = product_name.lower()
-    for brand in known_brands:
-        if name_lower.startswith(brand.lower()):
-            return brand.lower()
+    for brand_lower in _KNOWN_BRANDS_LOWER:
+        if name_lower.startswith(brand_lower):
+            return brand_lower
     return product_name.split()[0].lower()
 
 # Brand name variants that should be treated as identical when comparing
@@ -569,8 +586,10 @@ def products_match(name_a, name_b):
     base_a, shade_a = _split_name_shade(name_a)
     base_b, shade_b = _split_name_shade(name_b)
 
-    brand_a = _BRAND_ALIASES.get(get_brand(name_a), get_brand(name_a))
-    brand_b = _BRAND_ALIASES.get(get_brand(name_b), get_brand(name_b))
+    raw_brand_a = get_brand(name_a)
+    raw_brand_b = get_brand(name_b)
+    brand_a = _BRAND_ALIASES.get(raw_brand_a, raw_brand_a)
+    brand_b = _BRAND_ALIASES.get(raw_brand_b, raw_brand_b)
     if brand_a != brand_b:
         return 'different'
 
@@ -1281,15 +1300,40 @@ def get_next_alternative(customer_name, category, tier, already_rejected,
     best = scored[0][1]
     return best, f"Next alternative: {best['name']} (AED {best.get('retail_price_aed')})"
 
-def recommend(customer_name, box_type_override=None):
-    customers  = load_customers()
-    all_rec, recent_boxes, box_timeline = load_box_history()
-    prefs_all  = load_preferences()
-    freqs_all  = load_frequencies()
-    quiz_all   = load_quiz()
-    inventory  = load_inventory()
-    rejected_all = load_rejected_products()
-    blocked_brands_all = load_blocked_brands()
+def recommend(customer_name, box_type_override=None, _preloaded=None):
+    """_preloaded is an optional performance shortcut for callers that need
+    to run this for MANY customers in one request (see dashboard_generate_month
+    in app.py) -- normally every call reloads customers/inventory/history/etc.
+    fresh from the workbook, which is correct but wastefully slow when done
+    once per customer in a loop of 15-20 people (this was the actual cause
+    of Generate Month timing out and crashing the whole request on Render's
+    free-tier CPU). If the caller already loaded all of this once outside
+    the loop, it can pass it in here as a dict with keys: customers,
+    box_history (a (all_rec, recent_boxes, box_timeline) tuple), prefs,
+    freqs, quiz, inventory, rejected, blocked_brands -- and every customer
+    in the loop reuses the same snapshot instead of re-reading the whole
+    spreadsheet from scratch each time. None of this data is mutated
+    during a recommend() call, so reusing one snapshot across customers in
+    the same run is safe -- single-customer callers (swap, generate_for_customer,
+    etc.) don't pass this and keep behaving exactly as before."""
+    if _preloaded:
+        customers = _preloaded['customers']
+        all_rec, recent_boxes, box_timeline = _preloaded['box_history']
+        prefs_all = _preloaded['prefs']
+        freqs_all = _preloaded['freqs']
+        quiz_all = _preloaded['quiz']
+        inventory = _preloaded['inventory']
+        rejected_all = _preloaded['rejected']
+        blocked_brands_all = _preloaded['blocked_brands']
+    else:
+        customers  = load_customers()
+        all_rec, recent_boxes, box_timeline = load_box_history()
+        prefs_all  = load_preferences()
+        freqs_all  = load_frequencies()
+        quiz_all   = load_quiz()
+        inventory  = load_inventory()
+        rejected_all = load_rejected_products()
+        blocked_brands_all = load_blocked_brands()
 
     inv_cat_map = {p['name'].lower(): p['category'] for p in inventory}
 
