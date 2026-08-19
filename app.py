@@ -25,11 +25,12 @@ Endpoints:
                              already in the box (avoids same-brand repeats)
     returns: JSON with the next alternative, or a clear "none left" message
 """
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session, redirect, url_for
 import os
 import tempfile
 import importlib
 import recommend_v5
+from functools import wraps
 
 import requests
 import base64 as base64_lib
@@ -74,6 +75,51 @@ def push_to_github():
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
+# ---- Dashboard auth (single shared password — this is a 2-person internal
+# tool, not a public product, so one password kept in Render's env vars is
+# enough; nothing fancier is needed) ----
+app.secret_key = os.environ.get('DASHBOARD_SECRET_KEY', 'dev-only-change-me')
+DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD')
+from datetime import timedelta as _timedelta, datetime as _datetime
+app.permanent_session_lifetime = _timedelta(days=30)
+
+DASHBOARD_LOGIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snatched Beauty Box — Login</title>
+<style>
+  body{ font-family:-apple-system,Segoe UI,Roboto,sans-serif; background:linear-gradient(135deg,#C27BA0,#B4A7D6); min-height:100vh; margin:0; display:flex; align-items:center; justify-content:center; }
+  .box{ background:#fff; border-radius:16px; padding:36px 32px; width:300px; box-shadow:0 10px 30px rgba(0,0,0,0.15); text-align:center; }
+  h1{ font-size:18px; margin:0 0 20px; color:#3a2f38; }
+  input{ width:100%; box-sizing:border-box; padding:11px 14px; border-radius:8px; border:1px solid #ecdfe6; font-size:14px; margin-bottom:12px; }
+  button{ width:100%; padding:11px; border:none; border-radius:8px; background:#C27BA0; color:#fff; font-weight:700; font-size:14px; cursor:pointer; }
+  button:hover{ background:#a85f85; }
+  .err{ color:#c0506a; font-size:12.5px; margin-bottom:10px; font-weight:600; }
+</style></head>
+<body>
+  <div class="box">
+    <h1>🌸 Snatched Beauty Box</h1>
+    <!--ERROR-->
+    <form method="POST" action="/dashboard/do_login">
+      <input type="password" name="password" placeholder="Password" autofocus required>
+      <button type="submit">Log in</button>
+    </form>
+  </div>
+</body></html>"""
+
+def dashboard_login_required(f):
+    """Protects every /dashboard* route. GET requests for the page itself
+    get redirected to the login screen; API calls (fetch from the page's
+    own JS) get a clean 401 JSON instead of an HTML redirect, since the
+    frontend needs to detect 'not logged in' programmatically."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get('dashboard_authed'):
+            if request.method == 'GET' and request.accept_mimetypes.accept_html:
+                return redirect(url_for('dashboard_login_page'))
+            return jsonify({'error': 'Not logged in.'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
 @app.after_request
 def add_cors_headers(response):
     # Lets the customer-lookup dashboard webpage call this service directly
@@ -95,7 +141,43 @@ def health_check():
     # browser can hit this to check the deployment worked.
     return jsonify({'status': 'ok', 'service': 'snatched-recommend-engine'})
 
+@app.route('/dashboard/login', methods=['GET'])
+def dashboard_login_page():
+    """Simple one-field password screen — no username, since this is a
+    2-person internal tool. On success, sets a session cookie and sends
+    her straight into the dashboard."""
+    if session.get('dashboard_authed'):
+        return redirect('/dashboard')
+    return DASHBOARD_LOGIN_HTML
+
+@app.route('/dashboard/do_login', methods=['POST'])
+def dashboard_do_login():
+    if not DASHBOARD_PASSWORD:
+        return jsonify({'error': 'Dashboard password is not configured on the server yet.'}), 500
+    submitted = request.form.get('password', '')
+    if submitted == DASHBOARD_PASSWORD:
+        session['dashboard_authed'] = True
+        session.permanent = True
+        return redirect('/dashboard')
+    return DASHBOARD_LOGIN_HTML.replace(
+        '<!--ERROR-->', '<div class="err">Wrong password — try again.</div>'
+    )
+
+@app.route('/dashboard/logout', methods=['POST'])
+def dashboard_logout():
+    session.pop('dashboard_authed', None)
+    return redirect('/dashboard/login')
+
+_DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard.html')
+
+@app.route('/dashboard', methods=['GET'])
+@dashboard_login_required
+def dashboard_page():
+    with open(_DASHBOARD_HTML_PATH, encoding='utf-8') as f:
+        return f.read()
+
 @app.route('/customer_lookup', methods=['GET'])
+@dashboard_login_required
 def customer_lookup_endpoint():
     """Powers the customer-details dashboard. Given a customer's name,
     returns everything Iqra would otherwise have to hunt across multiple
@@ -115,23 +197,62 @@ def customer_lookup_endpoint():
         cid = cust['id']
 
         all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
-        product_history = sorted(all_rec.get(cid, []), key=lambda x: x[1] if len(x) > 1 else '')
+        # box_timeline[cid] is a list of (month, [product names]) tuples — one
+        # entry per box she actually received. all_received[cid] is just a
+        # deduped SET of product name strings with no month attached, so it
+        # must not be used here (indexing into a string byproduct gave garbled
+        # single-character "months"/"products" before this fix).
+        timeline = sorted(box_timeline.get(cid, []), key=lambda x: x[0] or '')
+        product_history = [
+            {'product': prod, 'month': month}
+            for month, prods in timeline
+            for prod in prods
+        ]
 
         quiz = recommend_v5.load_quiz().get(cid, {})
         prefs = recommend_v5.load_preferences().get(cid, {})
         freqs = recommend_v5.load_frequencies().get(cid, {})
 
+        # Every box ever recorded for her, newest first — including
+        # Cancelled ones, so the drawer can show "Cancel & restock" next
+        # to any committed-but-undelivered box (e.g. one built ahead of
+        # travel that turned out not to be needed) and show already-
+        # cancelled ones as a record. load_box_history() above skips
+        # Cancelled boxes on purpose (they must not count as received
+        # history), so this reads the boxes sheet directly instead.
+        ws_b = recommend_v5.wb['boxes']
+        customer_boxes = [
+            {'box_id': row[0], 'month': str(row[3]) if row[3] else None, 'status': row[4], 'box_type': row[5]}
+            for row in ws_b.iter_rows(min_row=2, values_only=True) if row[1] == cid
+        ]
+        customer_boxes.sort(key=lambda b: b['month'] or '', reverse=True)
+
+        # Exact confirmed/rejected shades on file for her, if Iqra has
+        # ever logged one — read-only reference, shown only when it
+        # actually exists for this customer.
+        shade_notes = recommend_v5.load_shade_reference().get(cust['name'].strip().lower(), [])
+
+        # Brands blocked for her in every category (see /dashboard/block_brand).
+        ws_bb = recommend_v5.wb['blocked_brands'] if 'blocked_brands' in recommend_v5.wb.sheetnames else None
+        blocked_brands = []
+        if ws_bb is not None:
+            for row in ws_bb.iter_rows(min_row=2, values_only=True):
+                if row[0] == cid and row[1]:
+                    blocked_brands.append({'brand': row[1], 'reason': row[2] or '', 'source_month': row[3] or ''})
+
         return jsonify({
             'customer_name': cust['name'],
             'customer_id': cid,
+            'status': cust.get('status'),
             'box_type': cust.get('box_type'),
             'billing_cadence': cust.get('billing_cadence'),
             'subscribed_since': cust.get('subscribed_since'),
+            'birthday': cust.get('birthday'),
             'notes': cust.get('notes'),
-            'product_history': [
-                {'product': p[0], 'month': p[1] if len(p) > 1 else None}
-                for p in product_history
-            ],
+            'boxes': customer_boxes[:8],
+            'shade_notes': shade_notes,
+            'blocked_brands': blocked_brands,
+            'product_history': product_history,
             'quiz': quiz,
             'preferences': prefs,
             'frequencies': freqs,
@@ -140,6 +261,7 @@ def customer_lookup_endpoint():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/customer_search_product', methods=['GET'])
+@dashboard_login_required
 def customer_search_product_endpoint():
     """Checks whether a specific customer has ever received a specific
     product before — the 'has she had this already' search Iqra wants."""
@@ -157,12 +279,226 @@ def customer_search_product_endpoint():
         cid = cust['id']
 
         all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+        timeline = sorted(box_timeline.get(cid, []), key=lambda x: x[0] or '')
         matches = [
-            {'product': p[0], 'month': p[1] if len(p) > 1 else None}
-            for p in all_rec.get(cid, [])
-            if product_query in p[0].lower()
+            {'product': prod, 'month': month}
+            for month, prods in timeline
+            for prod in prods
+            if product_query in prod.lower()
         ]
         return jsonify({'customer_name': cust['name'], 'query': product_query, 'matches': matches, 'has_received': len(matches) > 0})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/set_customer_status', methods=['POST'])
+@dashboard_login_required
+def dashboard_set_customer_status():
+    """Lets Iqra mark a customer Cancelled (or reactivate her) straight
+    from the dashboard. This is the ONLY thing that controls whether
+    future months generate a box for her — is_customer_due() in
+    recommend_v5 already refuses to build a box for anyone whose status
+    isn't 'active', so flipping this cell here is the whole fix for
+    'don't build her a box next month.' It does NOT touch any box
+    that's already been committed — cancel those separately below."""
+    customer_id = request.form.get('customer_id')
+    new_status = request.form.get('status')
+    if not customer_id or new_status not in ('Active', 'Cancelled'):
+        return jsonify({'error': 'customer_id and status (Active or Cancelled) are required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        id_col = 1
+        status_col = 5  # customers sheet: id, name, email, phone, status, ...
+        updated = False
+        for row in ws_c.iter_rows(min_row=2):
+            if row[id_col - 1].value == customer_id:
+                row[status_col - 1].value = new_status
+                updated = True
+                break
+        if not updated:
+            return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'customer_id': customer_id, 'status': new_status})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/cancel_box', methods=['POST'])
+@dashboard_login_required
+def dashboard_cancel_box():
+    """Undoes an already-committed box that turns out isn't actually
+    going out (e.g. a box built ahead of time before the owner traveled,
+    for a customer who then cancels before it ships). Restocks every
+    product in that box back into inventory and marks the box Cancelled
+    — the row is kept (not deleted) as a record, and load_box_history()
+    already skips Cancelled boxes so it won't count toward her 'received
+    before' history or bi-monthly gap math."""
+    box_id = request.form.get('box_id')
+    if not box_id:
+        return jsonify({'error': 'box_id is required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws_b = wb['boxes']
+        ws_i = wb['box_items']
+
+        box_row = None
+        for row in ws_b.iter_rows(min_row=2):
+            if row[0].value == box_id:
+                box_row = row
+                break
+        if not box_row:
+            return jsonify({'error': f'No box found with id "{box_id}".'}), 404
+        if str(box_row[4].value).strip().lower() == 'cancelled':
+            return jsonify({'success': True, 'already_cancelled': True})
+
+        products = [
+            row[6].value for row in ws_i.iter_rows(min_row=2)
+            if row[5].value == box_id and row[6].value
+        ]
+
+        ws_inv = wb['inventory']
+        hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+        n_col = hi.index('name') + 1
+        s_col = hi.index('stock_qty') + 1
+        inv_rows_by_name = {}
+        for row in ws_inv.iter_rows(min_row=2):
+            nm = row[n_col - 1].value
+            if nm:
+                inv_rows_by_name[nm] = row
+
+        restocked = []
+        not_found = []
+        for prod in products:
+            row = inv_rows_by_name.get(prod)
+            if row:
+                row[s_col - 1].value = (row[s_col - 1].value or 0) + 1
+                restocked.append(prod)
+            else:
+                not_found.append(prod)
+
+        box_row[4].value = 'Cancelled'
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({
+            'success': True,
+            'box_id': box_id,
+            'restocked_count': len(restocked),
+            'restocked_products': restocked,
+            'not_found_in_inventory': not_found,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+BLOCKED_BRANDS_SHEET = 'blocked_brands'
+BLOCKED_BRANDS_HEADERS = ['customer_id', 'brand', 'reason', 'source_month', 'customer_name']
+
+def _get_blocked_brands_sheet(create=False):
+    wb = recommend_v5.wb
+    if BLOCKED_BRANDS_SHEET not in wb.sheetnames:
+        if not create:
+            return None
+        ws = wb.create_sheet(BLOCKED_BRANDS_SHEET)
+        ws.append(BLOCKED_BRANDS_HEADERS)
+        return ws
+    return wb[BLOCKED_BRANDS_SHEET]
+
+@app.route('/dashboard/block_brand', methods=['POST'])
+@dashboard_login_required
+def dashboard_block_brand():
+    """Lets Iqra permanently block a whole brand for one customer, in
+    EVERY category — e.g. a customer messages her privately saying 'no
+    Elf products at all'. Stored in its own sheet (created on first use)
+    rather than buried in free-text notes, so it's unambiguous and the
+    engine can actually enforce it — recommend_v5's load_blocked_brands()
+    is checked by both a fresh box build and every swap path."""
+    customer_id = request.form.get('customer_id')
+    customer_name = request.form.get('customer_name', '')
+    brand = request.form.get('brand', '').strip()
+    reason = request.form.get('reason', '')
+    if not customer_id or not brand:
+        return jsonify({'error': 'customer_id and brand are required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_blocked_brands_sheet(create=True)
+        brand_lower = brand.lower()
+        # Don't add a duplicate row if this brand's already blocked for her.
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row[0] == customer_id and str(row[1] or '').strip().lower() == brand_lower:
+                return jsonify({'success': True, 'already_blocked': True})
+
+        target_month = recommend_v5.TARGET_MONTH or ''
+        ws.append([customer_id, brand, reason, target_month, customer_name])
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'brand': brand})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/unblock_brand', methods=['POST'])
+@dashboard_login_required
+def dashboard_unblock_brand():
+    """Removes a brand block for a customer (she's changed her mind, or
+    it was added by mistake)."""
+    customer_id = request.form.get('customer_id')
+    brand = request.form.get('brand', '').strip().lower()
+    if not customer_id or not brand:
+        return jsonify({'error': 'customer_id and brand are required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_blocked_brands_sheet(create=False)
+        if ws is None:
+            return jsonify({'success': True, 'removed': 0})
+
+        rows_to_delete = [
+            r for r in range(ws.max_row, 1, -1)
+            if ws.cell(r, 1).value == customer_id
+            and str(ws.cell(r, 2).value or '').strip().lower() == brand
+        ]
+        for r in rows_to_delete:
+            ws.delete_rows(r, 1)
+
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'removed': len(rows_to_delete)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/set_customer_notes', methods=['POST'])
+@dashboard_login_required
+def dashboard_set_customer_notes():
+    """Freeform notes box for anything that doesn't need to be a
+    structured rule — general context the owner wants on record for a
+    customer. (For 'never recommend this brand', use /dashboard/block_brand
+    instead — that's the one the engine actually reads and enforces.)"""
+    customer_id = request.form.get('customer_id')
+    notes = request.form.get('notes', '')
+    if not customer_id:
+        return jsonify({'error': 'customer_id is required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        notes_col = 15  # customers sheet: ... upgrade_date, notes
+        updated = False
+        for row in ws_c.iter_rows(min_row=2):
+            if row[0].value == customer_id:
+                row[notes_col - 1].value = notes
+                updated = True
+                break
+        if not updated:
+            return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'notes': notes})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -516,6 +852,45 @@ def generate_month_rows_endpoint():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+    target_month = request.form.get('target_month')
+    if not target_month:
+        return jsonify({'error': 'target_month is required, e.g. 2026-09'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        recommend_v5.set_target_month(target_month)
+        recommend_v5.reset_allocations()
+
+        customers = recommend_v5.load_customers()
+        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+
+        results = []
+        for cid, cust in customers.items():
+            due, reason = recommend_v5.is_customer_due(cust, box_timeline, target_month)
+            if not due:
+                continue
+            out = recommend_v5.recommend(cust['name'])
+            if isinstance(out, str):
+                continue
+            (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
+             hist_pat, total, timeline, inv_cat_map, value_summary) = out
+            results.append({
+                'customer_name': c['name'],
+                'customer_id': c['id'],
+                'box_type': c['box_type'],
+                'products': [
+                    {'name': p['name'], 'category': p['category'], 'tier': p['tier'],
+                     'stock': p['stock'], 'price_aed': p.get('retail_price_aed')}
+                    for p in picks
+                ],
+                'value_summary': value_summary,
+                'warnings': warnings,
+            })
+
+        return jsonify({'target_month': target_month, 'customers': results})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/generate_month_formatted', methods=['POST'])
 def generate_month_formatted_endpoint():
     """Does the whole job in one call: generates recommendations for every
@@ -609,6 +984,637 @@ def create_box_record_endpoint():
         recommend_v5.wb.save(recommend_v5.path)
         push_to_github()
         return jsonify({'success': True, 'box_id': box_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# =========================================================================
+# DASHBOARD — everything below powers the real dashboard (not Make.com).
+# It all reads/writes ONE working sheet ("dashboard_working") that lives
+# inside the same bundled workbook everything else already uses — no
+# Google Sheets involved, no file upload/export round-trip. Every action
+# here is self-contained: it writes its own result straight into the sheet,
+# so state survives a page reload, a phone-to-laptop switch, or a restart.
+# =========================================================================
+
+DASH_SHEET = 'dashboard_working'
+DASH_HEADERS = ['#', 'Product Name', 'Category', 'Tier', 'Stock', 'Why', 'Status', 'Manual', 'Price']
+
+def _max_id_suffix(ws, col, prefix):
+    """Returns the highest numeric suffix currently used by IDs like
+    'BOX0188' / 'BI00940' in the given column — robust against workbooks
+    that have blank formatted rows extending past the real last data row
+    (ws.max_row can't be trusted in that case)."""
+    best = 0
+    for row in ws.iter_rows(min_row=2, min_col=col, max_col=col, values_only=True):
+        val = row[0]
+        if isinstance(val, str) and val.startswith(prefix):
+            try:
+                best = max(best, int(val[len(prefix):]))
+            except ValueError:
+                continue
+    return best
+
+def _get_dash_sheet(create=False):
+    wb = recommend_v5.wb
+    if DASH_SHEET not in wb.sheetnames:
+        if not create:
+            return None
+        ws = wb.create_sheet(DASH_SHEET)
+        ws.append(DASH_HEADERS)
+        return ws
+    return wb[DASH_SHEET]
+
+def _parse_dash_sheet(ws):
+    """Reads the whole working sheet back into structured JSON. Header rows
+    store customer_id/box_type/month in columns B/C/D (not shown to a
+    human — this sheet is internal-only); item rows store the actual
+    product fields. Returns a list of customer blocks in sheet order."""
+    if ws is None:
+        return []
+    customers = []
+    current = None
+    for r in range(2, ws.max_row + 1):
+        col_a = ws.cell(r, 1).value
+        if col_a is None or col_a == '':
+            continue
+        if isinstance(col_a, str) and col_a.startswith('HEADER:'):
+            if current:
+                customers.append(current)
+            current = {
+                'customer_name': col_a[len('HEADER:'):].strip(),
+                'customer_id': ws.cell(r, 2).value,
+                'box_type': ws.cell(r, 3).value,
+                'month': ws.cell(r, 4).value,
+                'header_row': r,
+                'items': [],
+            }
+        else:
+            # item row — column A holds the item index (1-5)
+            if current is None:
+                continue
+            current['items'].append({
+                'row_number': r,
+                'idx': col_a,
+                'name': ws.cell(r, 2).value,
+                'category': ws.cell(r, 3).value,
+                'tier': ws.cell(r, 4).value,
+                'stock': ws.cell(r, 5).value,
+                'why': ws.cell(r, 6).value,
+                'status': ws.cell(r, 7).value or 'Pending',
+                'manual': bool(ws.cell(r, 8).value),
+                'price': ws.cell(r, 9).value,
+            })
+    if current:
+        customers.append(current)
+    return customers
+
+def _find_item_row_context(ws, row_number):
+    """Given a row number for one item, returns (customer_block, item_dict)
+    so actions can see the customer_id/other-items-in-this-box context
+    needed for brand-duplicate checks, without re-parsing the whole sheet
+    by hand each time."""
+    blocks = _parse_dash_sheet(ws)
+    for b in blocks:
+        for it in b['items']:
+            if it['row_number'] == row_number:
+                return b, it
+    return None, None
+
+@app.route('/dashboard/generate_month', methods=['POST'])
+@dashboard_login_required
+def dashboard_generate_month():
+    """Builds fresh recommendations for every due customer and writes them
+    into the working sheet, replacing whatever was there before. Refuses
+    to clobber a month that still has unapproved work unless force=true —
+    generating twice by accident shouldn't silently throw away swaps."""
+    target_month = request.form.get('target_month')
+    force = request.form.get('force') == 'true'
+    if not target_month:
+        return jsonify({'error': 'target_month is required, e.g. 2026-11'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+
+        existing = _get_dash_sheet(create=False)
+        existing_blocks = _parse_dash_sheet(existing) if (existing is not None and existing.max_row > 1) else []
+
+        if existing_blocks and not force:
+            still_open = [b['customer_name'] for b in existing_blocks if b.get('month') != target_month
+                          or any(i['status'] != 'Approved' for i in b['items'])]
+            if still_open:
+                return jsonify({
+                    'error': 'There is unfinished work already on the board.',
+                    'unfinished_customers': still_open,
+                    'hint': 'Pass force=true to overwrite it anyway.',
+                }), 409
+
+        # Any item still sitting on the board as 'Approved' has already had
+        # its stock decremented (see /dashboard/approve). If we're about to
+        # wipe the board — either because everything was Approved, or
+        # because force=true is throwing away in-progress work — that stock
+        # must go back into inventory first, or it's gone for good with
+        # nothing to show for it.
+        if existing_blocks:
+            approved_names = [i['name'] for b in existing_blocks for i in b['items'] if i['status'] == 'Approved']
+            if approved_names:
+                ws_inv = wb['inventory']
+                hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+                n_col = hi.index('name') + 1
+                s_col = hi.index('stock_qty') + 1
+                inv_rows_by_name = {}
+                for row in ws_inv.iter_rows(min_row=2):
+                    nm = row[n_col - 1].value
+                    if nm:
+                        inv_rows_by_name[nm] = row
+                for name in approved_names:
+                    row = inv_rows_by_name.get(name)
+                    if row:
+                        row[s_col - 1].value = (row[s_col - 1].value or 0) + 1
+
+        if DASH_SHEET in wb.sheetnames:
+            del wb[DASH_SHEET]
+        ws = _get_dash_sheet(create=True)
+
+        recommend_v5.set_target_month(target_month)
+        recommend_v5.reset_allocations()
+        customers = recommend_v5.load_customers()
+        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
+
+        built = 0
+        for cid, cust in customers.items():
+            due, reason = recommend_v5.is_customer_due(cust, box_timeline, target_month)
+            if not due:
+                continue
+            out = recommend_v5.recommend(cust['name'])
+            if isinstance(out, str):
+                continue
+            (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
+             hist_pat, total, timeline, inv_cat_map, value_summary) = out
+
+            prefs = recommend_v5.load_preferences().get(cid, {})
+            freqs = recommend_v5.load_frequencies().get(cid, {})
+            quiz = recommend_v5.load_quiz().get(cid, {})
+            age = ''
+            bday = cust.get('birthday')
+            if bday:
+                try:
+                    from datetime import datetime as _dt
+                    bdate = _dt.strptime(str(bday)[:10], '%Y-%m-%d')
+                    today = _dt.now()
+                    age = today.year - bdate.year - ((today.month, today.day) < (bdate.month, bdate.day))
+                except Exception:
+                    age = ''
+
+            ws.append([f'HEADER: {c["name"]}', cid, c['box_type'], target_month])
+            for i, p in enumerate(picks, start=1):
+                why_text = recommend_v5.build_explanation(
+                    p, cid, hard_block, soft_avoid, hist_pat, total,
+                    timeline, inv_cat_map, prefs, freqs, quiz, age, cust.get('notes', '')
+                )
+                ws.append([i, p['name'], p['category'], p['tier'], p['stock'],
+                           why_text, 'Pending', False, p.get('retail_price_aed')])
+            built += 1
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'target_month': target_month, 'customers_built': built})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/state', methods=['GET'])
+@dashboard_login_required
+def dashboard_state():
+    """Returns the full current board — every customer, every item, current
+    status — for the review page to render. Called on page load and after
+    the drawer/manual-entry flows need a fresh read."""
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        blocks = _parse_dash_sheet(ws)
+        return jsonify({'customers': blocks})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+LOW_STOCK_THRESHOLD = 3  # a category with this many or fewer total units left,
+                          # across every product in it, is flagged "critically low"
+
+@app.route('/dashboard/home_stats', methods=['GET'])
+@dashboard_login_required
+def dashboard_home_stats():
+    """Powers the two Home-page stat cards from the original mockup that
+    weren't wired up yet: birthdays falling in the month currently being
+    reviewed (matched on month-of-year, so it's correct every year — not
+    tied to the calendar month you happen to log in), and inventory
+    categories running critically low. Both use real data, no samples."""
+    target_month = request.args.get('target_month')  # 'YYYY-MM', optional
+
+    try:
+        importlib.reload(recommend_v5)
+        customers = recommend_v5.load_customers()
+
+        birthdays = []
+        if target_month:
+            try:
+                target_mm = int(target_month.split('-')[1])
+            except (ValueError, IndexError):
+                target_mm = None
+            if target_mm:
+                for c in customers.values():
+                    bday = c.get('birthday')
+                    if not bday:
+                        continue
+                    try:
+                        bmonth = int(str(bday)[5:7])
+                    except (ValueError, IndexError):
+                        continue
+                    if bmonth == target_mm and str(c.get('status', '')).strip().lower() == 'active':
+                        birthdays.append({
+                            'name': c['name'],
+                            'birthday': str(bday)[:10],
+                            'subscribed_since': c.get('subscribed_since'),
+                        })
+        birthdays.sort(key=lambda b: b['birthday'][8:10] if len(b['birthday']) >= 10 else '')
+
+        inv = recommend_v5.load_inventory()
+        totals = {}
+        for p in inv:
+            cat = p.get('category')
+            if not cat:
+                continue
+            totals[cat] = totals.get(cat, 0) + (p.get('stock') or 0)
+        low_stock = sorted(
+            [{'category': cat, 'total_stock': qty} for cat, qty in totals.items() if qty <= LOW_STOCK_THRESHOLD],
+            key=lambda x: x['total_stock']
+        )
+
+        return jsonify({'birthdays': birthdays, 'low_stock_categories': low_stock, 'low_stock_threshold': LOW_STOCK_THRESHOLD})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/all_customers', methods=['GET'])
+@dashboard_login_required
+def dashboard_all_customers():
+    """Every customer on file, regardless of whether a month's board is
+    currently loaded — powers the Customers-tab search autocomplete so
+    Iqra can find and cancel anyone any day, not just customers who
+    happen to be on the most recently generated month's board."""
+    try:
+        importlib.reload(recommend_v5)
+        customers = recommend_v5.load_customers()
+        out = sorted(
+            [{'id': c['id'], 'name': c['name'], 'status': c.get('status')} for c in customers.values()],
+            key=lambda c: (c['name'] or '').lower()
+        )
+        return jsonify({'customers': out})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/inventory', methods=['GET'])
+@dashboard_login_required
+def dashboard_inventory():
+    """Real, in-stock inventory — powers the 'Enter my own' search box.
+    Only ever returns items with stock > 0, same rule the manual-pick
+    endpoint itself enforces."""
+    try:
+        importlib.reload(recommend_v5)
+        inv = recommend_v5.load_inventory()
+        items = [
+            {'name': p['name'], 'category': p['category'], 'tier': p['tier'],
+             'stock': p['stock'], 'price': p.get('retail_price_aed')}
+            for p in inv if (p['stock'] or 0) > 0
+        ]
+        return jsonify({'items': items})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def _restock_product_by_name(wb, product_name):
+    """Puts one unit of a product back into inventory by name. Used
+    whenever a row that was already Approved (and had therefore already
+    had its stock taken, per /dashboard/approve) is about to be
+    overwritten with a different product by a swap or manual pick — the
+    old product's stock must come back, or it's gone for good even
+    though she never actually kept it in the box."""
+    if not product_name:
+        return False
+    ws_inv = wb['inventory']
+    hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+    n_col = hi.index('name') + 1
+    s_col = hi.index('stock_qty') + 1
+    for row in ws_inv.iter_rows(min_row=2):
+        if row[n_col - 1].value == product_name:
+            row[s_col - 1].value = (row[s_col - 1].value or 0) + 1
+            return True
+    return False
+
+def _write_item_row(ws, row_number, product, why, manual=False):
+    ws.cell(row_number, 2).value = product['name']
+    ws.cell(row_number, 3).value = product['category']
+    ws.cell(row_number, 4).value = product['tier']
+    ws.cell(row_number, 5).value = product['stock']
+    ws.cell(row_number, 6).value = why
+    ws.cell(row_number, 7).value = 'Pending'  # any change re-opens it for approval
+    ws.cell(row_number, 8).value = manual
+    ws.cell(row_number, 9).value = product.get('retail_price_aed', product.get('price'))
+
+@app.route('/dashboard/swap', methods=['POST'])
+@dashboard_login_required
+def dashboard_swap():
+    """Same-category swap — the existing, already-tested alternative-finding
+    logic, but self-contained: finds the next alternative AND writes it
+    straight into the sheet in one call, instead of returning a suggestion
+    for something else to write down separately."""
+    row_number = request.form.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(row_number)
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        block, item = _find_item_row_context(ws, row_number)
+        if not item:
+            return jsonify({'error': f'No item found at row {row_number}.'}), 404
+        recommend_v5.set_target_month(block['month'])  # eligibility math must use the
+                                                         # month being reviewed, not today's
+
+        other_products = [i['name'] for i in block['items'] if i['row_number'] != row_number]
+        product, message = recommend_v5.get_next_alternative(
+            block['customer_name'], item['category'], item['tier'],
+            already_rejected=[item['name']], current_box_products=other_products
+        )
+        if product is None:
+            return jsonify({'found': False, 'message': message})
+
+        # If she'd already approved this slot (stock already taken for it,
+        # per /dashboard/approve) and only now decided to swap it, the
+        # product she's replacing must go back into inventory — otherwise
+        # it's permanently gone even though it never actually shipped.
+        if item['status'] == 'Approved':
+            _restock_product_by_name(recommend_v5.wb, item['name'])
+
+        _write_item_row(ws, row_number, product,
+                         'Owner-requested swap — next best match for her preferences, timing, and brand rules.')
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+        updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
+        return jsonify({'found': True, 'item': updated})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/swap_category', methods=['POST'])
+@dashboard_login_required
+def dashboard_swap_category():
+    """Different-category swap — same real eligibility engine (stock,
+    history, frequency, brand rules), just pointed at a category she picked
+    instead of the slot's original one. Keeps her plan's tier (Essentials/
+    Prestige) fixed since that's billing-related, only category changes."""
+    row_number = request.form.get('row_number')
+    new_category = request.form.get('category')
+    if not row_number or not new_category:
+        return jsonify({'error': 'row_number and category are both required.'}), 400
+    row_number = int(row_number)
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        block, item = _find_item_row_context(ws, row_number)
+        if not item:
+            return jsonify({'error': f'No item found at row {row_number}.'}), 404
+        recommend_v5.set_target_month(block['month'])
+        old_category = item['category']
+
+        other_products = [i['name'] for i in block['items'] if i['row_number'] != row_number]
+        product, message = recommend_v5.get_next_alternative(
+            block['customer_name'], new_category, item['tier'],
+            already_rejected=[], current_box_products=other_products
+        )
+        if product is None:
+            return jsonify({'found': False, 'message': message})
+
+        if item['status'] == 'Approved':
+            _restock_product_by_name(recommend_v5.wb, item['name'])
+
+        _write_item_row(ws, row_number, product,
+                         f'Owner-requested category change — swapped from "{old_category}" to "{new_category}".')
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+        updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
+        return jsonify({'found': True, 'item': updated, 'old_category': old_category, 'new_category': new_category})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/manual_pick', methods=['POST'])
+@dashboard_login_required
+def dashboard_manual_pick():
+    """Owner types in a specific product herself — no scoring/eligibility
+    engine involved, since she's overriding it on purpose. Still validates
+    the product is real and in stock, and still runs the brand-duplicate
+    and repeat-history safety checks so she sees a warning if either applies
+    (she can still proceed either way — it's her call)."""
+    row_number = request.form.get('row_number')
+    product_name = request.form.get('product_name')
+    if not row_number or not product_name:
+        return jsonify({'error': 'row_number and product_name are both required.'}), 400
+    row_number = int(row_number)
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        block, item = _find_item_row_context(ws, row_number)
+        if not item:
+            return jsonify({'error': f'No item found at row {row_number}.'}), 404
+
+        inventory = recommend_v5.load_inventory()
+        product = next((p for p in inventory if p['name'].lower() == product_name.lower()), None)
+        if not product:
+            return jsonify({'error': f'"{product_name}" is not a real, current inventory item.'}), 400
+        if (product['stock'] or 0) < 1:
+            return jsonify({'error': f'"{product_name}" is out of stock right now.'}), 400
+
+        new_brand = recommend_v5.get_brand(product['name'])
+        brand_clash = any(
+            recommend_v5.get_brand(i['name']) == new_brand
+            for i in block['items'] if i['row_number'] != row_number
+        )
+
+        customers = recommend_v5.load_customers()
+        cust = next((c for c in customers.values() if c['name'] == block['customer_name']), None)
+        all_rec, _, _ = recommend_v5.load_box_history()
+        repeat = bool(cust) and product['name'].lower() in all_rec.get(cust['id'], set())
+        blocked = bool(cust) and new_brand in recommend_v5.load_blocked_brands().get(cust['id'], set())
+
+        if item['status'] == 'Approved' and item['name'] != product['name']:
+            _restock_product_by_name(recommend_v5.wb, item['name'])
+
+        _write_item_row(ws, row_number, product,
+                         'Owner-selected manually — chosen directly instead of an engine suggestion.',
+                         manual=True)
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+
+        updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
+        return jsonify({'success': True, 'item': updated, 'brand_clash': brand_clash, 'repeat': repeat, 'blocked': blocked, 'brand': new_brand})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/approve', methods=['POST'])
+@dashboard_login_required
+def dashboard_approve():
+    """Marks one item approved and decrements its stock immediately —
+    same real-time-stock-tracking behavior as the existing approve_item,
+    just also setting the Status column so state is self-contained."""
+    row_number = request.form.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(row_number)
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        block, item = _find_item_row_context(ws, row_number)
+        if not item:
+            return jsonify({'error': f'No item found at row {row_number}.'}), 404
+        if item['status'] == 'Approved':
+            return jsonify({'success': True, 'already_approved': True})
+
+        ws_inv = recommend_v5.wb['inventory']
+        hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+        n_col = hi.index('name') + 1
+        s_col = hi.index('stock_qty') + 1
+        updated = False
+        for row in ws_inv.iter_rows(min_row=2):
+            if row[n_col - 1].value == item['name']:
+                old_stock = row[s_col - 1].value or 0
+                row[s_col - 1].value = max(0, old_stock - 1)
+                updated = True
+                break
+        if not updated:
+            return jsonify({'error': f'Product "{item["name"]}" not found in inventory.'}), 400
+
+        ws.cell(row_number, 7).value = 'Approved'
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/unapprove', methods=['POST'])
+@dashboard_login_required
+def dashboard_unapprove():
+    """Reverses /dashboard/approve — restores the stock it took."""
+    row_number = request.form.get('row_number')
+    if not row_number:
+        return jsonify({'error': 'row_number is required.'}), 400
+    row_number = int(row_number)
+
+    try:
+        importlib.reload(recommend_v5)
+        ws = _get_dash_sheet(create=False)
+        block, item = _find_item_row_context(ws, row_number)
+        if not item:
+            return jsonify({'error': f'No item found at row {row_number}.'}), 404
+        if item['status'] != 'Approved':
+            return jsonify({'success': True, 'already_pending': True})
+
+        ws_inv = recommend_v5.wb['inventory']
+        hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
+        n_col = hi.index('name') + 1
+        s_col = hi.index('stock_qty') + 1
+        for row in ws_inv.iter_rows(min_row=2):
+            if row[n_col - 1].value == item['name']:
+                row[s_col - 1].value = (row[s_col - 1].value or 0) + 1
+                break
+
+        ws.cell(row_number, 7).value = 'Pending'
+        recommend_v5.wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/download_workbook', methods=['GET'])
+@dashboard_login_required
+def dashboard_download_workbook():
+    """Lets Iqra download the actual live spreadsheet, exactly as it is
+    on the server right now — every customer, every box ever committed,
+    full inventory — as one .xlsx file she can open in Excel or Google
+    Sheets any time she wants the whole picture in one place instead of
+    looking customer-by-customer. This is a snapshot at download time,
+    not a live-synced sheet — nothing on her computer stays connected to
+    the server after she downloads it; to see anything fresher she just
+    downloads again."""
+    try:
+        importlib.reload(recommend_v5)
+        from flask import send_file
+        return send_file(
+            recommend_v5.path, as_attachment=True,
+            download_name=f'snatched_beauty_box_master_{_datetime.now().strftime("%Y-%m-%d")}.xlsx'
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/commit_month', methods=['POST'])
+@dashboard_login_required
+def dashboard_commit_month():
+    """Commits every customer on the board who is fully approved (all 5
+    items) — writes permanent boxes/box_items records (same schema
+    /create_box_record and /finalize_item already use) and removes them
+    from the working sheet so they can't be double-committed. Customers
+    who aren't fully approved yet are left on the board untouched."""
+    target_month = request.form.get('target_month')
+    if not target_month:
+        return jsonify({'error': 'target_month is required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws = _get_dash_sheet(create=False)
+        blocks = _parse_dash_sheet(ws)
+
+        ws_boxes = wb['boxes']
+        ws_items = wb['box_items']
+        # Scan actual IDs rather than trusting max_row — some exported copies
+        # of this workbook carry blank formatted rows well past the real
+        # last row, which would silently skip hundreds of row numbers.
+        next_box_num = _max_id_suffix(ws_boxes, 1, 'BOX')
+        next_item_num = _max_id_suffix(ws_items, 1, 'BI')
+
+        committed = []
+        skipped = []
+        rows_to_delete = []
+
+        for b in blocks:
+            if b.get('month') != target_month:
+                continue
+            if not b['items'] or any(i['status'] != 'Approved' for i in b['items']):
+                skipped.append(b['customer_name'])
+                continue
+
+            next_box_num += 1
+            box_id = f'BOX{next_box_num:04d}'
+            ws_boxes.append([box_id, b['customer_id'], b['customer_name'], target_month, 'sent', b['box_type']])
+            for it in b['items']:
+                next_item_num += 1
+                ws_items.append([f'BI{next_item_num:05d}', b['customer_name'], b['customer_id'],
+                                  target_month, b['box_type'], box_id, it['name']])
+
+            committed.append(b['customer_name'])
+            rows_to_delete.append(b['header_row'])
+            rows_to_delete.extend(i['row_number'] for i in b['items'])
+
+        for r in sorted(rows_to_delete, reverse=True):
+            ws.delete_rows(r, 1)
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({
+            'success': True,
+            'target_month': target_month,
+            'committed_customers': committed,
+            'still_pending_customers': skipped,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

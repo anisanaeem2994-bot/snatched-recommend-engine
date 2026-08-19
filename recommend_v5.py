@@ -84,7 +84,11 @@ def load_box_history():
     ws_b = wb['boxes']
     cust_boxes = defaultdict(list)
     for row in ws_b.iter_rows(min_row=2, values_only=True):
-        if row[1]: cust_boxes[row[1]].append((str(row[3]), row[0]))
+        # Skip boxes marked Cancelled — she never actually received these,
+        # so they must not count as "received before" history, count toward
+        # bi-monthly gap math, or block brand-dedup for her next real box.
+        if row[1] and str(row[4]).strip().lower() != 'cancelled':
+            cust_boxes[row[1]].append((str(row[3]), row[0]))
 
     for cid in cust_boxes:
         cust_boxes[cid].sort(key=lambda x: x[0])
@@ -127,14 +131,147 @@ def load_frequencies():
     return f
 
 def load_quiz():
+    # quiz_responses columns: response_id, customer_id, name, skin_tone,
+    # eye_color, hair_color, makeup_comfort, submitted_at — note the 'name'
+    # column at index 2 that sits between customer_id and skin_tone. (Bug
+    # fixed 2026-10: every field below was previously read one column too
+    # early, so 'skin_tone' was actually reading each customer's own name.)
     ws = wb['quiz_responses']
     q = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
         if row[1]: q[row[1]] = {
-            'skin_tone': row[2], 'eye_color': row[3],
-            'hair_color': row[4], 'makeup_comfort': row[5]
+            'skin_tone': row[3], 'eye_color': row[4],
+            'hair_color': row[5], 'makeup_comfort': row[6]
         }
     return q
+
+def load_rejected_products():
+    """
+    Reads the 'rejected_products' sheet: a log of products Iqra has
+    explicitly said are wrong for a specific customer (wrong shade, wrong
+    brand, not her taste — a genuine mismatch), as opposed to a swap that
+    was really about timing/box-balance. Populated during monthly review
+    when a swap note is read as a real mismatch, not auto-derived from
+    every swap. Returns {customer_id: {product_name_lower, ...}}.
+    Falls back to an empty dict if the sheet doesn't exist yet (e.g. an
+    older bundled workbook) so this never breaks a live run.
+    """
+    if 'rejected_products' not in wb.sheetnames:
+        return defaultdict(set)
+    ws = wb['rejected_products']
+    out = defaultdict(set)
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row[0] or not row[1]:
+            continue
+        out[row[0]].add(str(row[1]).lower().strip())
+    return out
+
+def load_blocked_brands():
+    """
+    Reads the 'blocked_brands' sheet: brands Iqra has said a customer
+    should NEVER get, in ANY category (e.g. a customer messages her
+    privately saying 'no Elf products at all'). This is deliberately
+    separate from rejected_products (which blocks one specific product)
+    and from the free-text 'no elf complexion' pattern in customers.notes
+    (which only ever covered complexion categories) — this is a full,
+    every-category brand block, and it's enforced everywhere a product
+    gets suggested: a fresh box build (recommend()) AND a swap
+    (get_next_alternative() / get_next_swap_alternative()).
+    Returns {customer_id: {brand_lower, ...}}. Falls back to an empty
+    dict if the sheet doesn't exist yet so this never breaks a live run.
+    """
+    if 'blocked_brands' not in wb.sheetnames:
+        return defaultdict(set)
+    ws = wb['blocked_brands']
+    out = defaultdict(set)
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row[0] or not row[1]:
+            continue
+        out[row[0]].add(str(row[1]).lower().strip())
+    return out
+
+def load_shade_reference():
+    """
+    Reads the 'shade_reference' sheet: Iqra's running memory of exact
+    confirmed/rejected shades per customer, per category — read-only
+    reference info for her to see while reviewing, NOT enforced by the
+    engine (shade-matching isn't something the code can judge on its
+    own; this is here so she doesn't have to remember or cross-check by
+    hand). Returns {customer_name_lower: [ {category, confirmed, avoid,
+    details, source}, ... ]}. Skips the sheet's own 'HOW TO USE' header
+    row and anything that isn't a real data row.
+    """
+    if 'shade_reference' not in wb.sheetnames:
+        return {}
+    ws = wb['shade_reference']
+    out = defaultdict(list)
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        name = row[0]
+        if not name or str(name).strip().upper().startswith('HOW TO USE'):
+            continue
+        out[str(name).strip().lower()].append({
+            'category': row[1] or '',
+            'confirmed': row[2] or '',
+            'avoid': row[3] or '',
+            'details': row[4] or '',
+            'source': row[5] or '',
+        })
+    return out
+
+def load_discovery_log():
+    """
+    Reads the 'discovery_log' sheet: a record of which 'discovery' picks
+    (brand-new-category items, per the owner's 1-3x/year rule) have
+    already been given to which customer and when. Columns: customer_id,
+    month ('YYYY-MM'), category, product_name. Written to by the
+    monthly build script whenever a discovery pick is actually used —
+    recommend() only reads it to decide whether a customer is still due
+    for one this year. Falls back to an empty dict if the sheet doesn't
+    exist yet, so this never breaks a live run on an older workbook.
+    Returns {customer_id: [(month, category), ...]}.
+    """
+    if 'discovery_log' not in wb.sheetnames:
+        return defaultdict(list)
+    ws = wb['discovery_log']
+    out = defaultdict(list)
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row[0] or not row[1]:
+            continue
+        out[row[0]].append((str(row[1]), row[2]))
+    return out
+
+def discovery_eligible(cid, discovery_log, target_month_str, max_per_year=3, min_gap_months=2):
+    """
+    Owner's rule: 1-3 times a year she can send something outside the
+    customer's usual pattern, to help them discover new things. Returns
+    True if this customer hasn't already hit that cap in the trailing 12
+    months AND hasn't had one in the last `min_gap_months` (so they land
+    spread out over the year rather than clustering).
+    """
+    entries = discovery_log.get(cid, [])
+    if not entries:
+        return True
+    try:
+        target_dt = datetime.strptime(target_month_str + '-01', '%Y-%m-%d')
+    except:
+        return True
+    count_last_12mo = 0
+    most_recent_gap = None
+    for month_str, _cat in entries:
+        try:
+            dt = datetime.strptime(month_str + '-01', '%Y-%m-%d')
+        except:
+            continue
+        gap = (target_dt.year - dt.year) * 12 + (target_dt.month - dt.month)
+        if 0 <= gap < 12:
+            count_last_12mo += 1
+        if most_recent_gap is None or gap < most_recent_gap:
+            most_recent_gap = gap
+    if count_last_12mo >= max_per_year:
+        return False
+    if most_recent_gap is not None and most_recent_gap < min_gap_months:
+        return False
+    return True
 
 def load_inventory():
     ws = wb['inventory']
@@ -199,8 +336,25 @@ def optimize_box_value(results, pool_by_tier, box_type):
         return sum(p.get('retail_price_aed') or 0 for p in items)
 
     current_total = total_value(results)
-    MARGINAL_PCT = 0.10  # within 10% of target counts as "marginal" — leave as is
+    # Widened 2026-10 (was 0.10): forcing a swap for every box more than 10%
+    # under/over target was the main source of same-brand-twice boxes, since
+    # these swaps never checked brand. A wider band means fewer forced swaps
+    # overall, and the ones that do still happen are now brand-aware too (below).
+    MARGINAL_PCT = 0.20  # within 20% of target counts as "close enough" — leave as is
     marginal_floor = target * (1 - MARGINAL_PCT)
+
+    def brand_safe_candidates(pool, tier, cat, exclude_name, exclude_brand_of, price_filter):
+        """Same-tier/category candidates, price_filter applied, preferring ones
+        whose brand isn't already used elsewhere in the box. Falls back to
+        brand-colliding candidates only if no brand-safe option exists at all —
+        never leaves a swap undone just because every option collides."""
+        current_brands = {get_brand(p['name']) for p in results if p['name'] != exclude_name}
+        base = [p for p in pool
+                if p['category'] == cat
+                and p['name'] != exclude_name
+                and price_filter(p.get('retail_price_aed') or 0)]
+        safe = [p for p in base if get_brand(p['name']) not in current_brands]
+        return safe if safe else base
 
     swapped_any = False
     if current_total < marginal_floor:
@@ -211,10 +365,9 @@ def optimize_box_value(results, pool_by_tier, box_type):
                 break
             tier = low_item['tier']
             cat = low_item['category']
-            candidates = [p for p in pool_by_tier.get(tier, [])
-                          if p['category'] == cat
-                          and p['name'] != low_item['name']
-                          and (p.get('retail_price_aed') or 0) > (low_item.get('retail_price_aed') or 0)]
+            candidates = brand_safe_candidates(
+                pool_by_tier.get(tier, []), tier, cat, low_item['name'], low_item,
+                lambda price: price > (low_item.get('retail_price_aed') or 0))
             if candidates:
                 # Pick whichever candidate gets the box closest to (but not
                 # wildly past) the target — not just the single most expensive
@@ -244,10 +397,9 @@ def optimize_box_value(results, pool_by_tier, box_type):
                 break
             tier = high_item['tier']
             cat = high_item['category']
-            candidates = [p for p in pool_by_tier.get(tier, [])
-                          if p['category'] == cat
-                          and p['name'] != high_item['name']
-                          and (p.get('retail_price_aed') or 0) < (high_item.get('retail_price_aed') or 0)]
+            candidates = brand_safe_candidates(
+                pool_by_tier.get(tier, []), tier, cat, high_item['name'], high_item,
+                lambda price: price < (high_item.get('retail_price_aed') or 0))
             if candidates:
                 gap_needed = target - total_value(results)
                 best = min(candidates,
@@ -297,6 +449,15 @@ FREQ_TO_CAT = {
 
 CAT_TO_FREQ = {v: k for k, v in FREQ_TO_CAT.items()}
 FREQ_WEIGHT = {'Often': 3, 'Sometimes': 2, 'Rarely': 0}
+
+def get_freq_for_category(cat, freqs):
+    """Single source of truth for 'what frequency preference governs this
+    product category' — used everywhere instead of scattered
+    next((fk for fk,fc in FREQ_TO_CAT.items() if fc==cat), '') lookups,
+    so the pool filter, the scorer, and the explanation text can never
+    silently disagree on which freq key a category maps to."""
+    fkey = CAT_TO_FREQ.get(cat)
+    return freqs.get(fkey, 'Sometimes') if fkey else 'Sometimes'
 LIP_SUBCATS = {'Lips - Lipstick', 'Lips - Liquid Lipstick', 'Lips - Gloss',
                'Lips - Liner', 'Lips - Balm', 'Lips - Stain',
                'Lips - Plumper', 'Lips - Lip Oil'}
@@ -608,6 +769,19 @@ def get_recent_subcats(recent_boxes, inv_cat_map):
 
     return hard_block, soft_avoid
 
+def get_recent_brands(recent_boxes, months_back=2):
+    """Owner's rule: repeating a brand across different months is fine to
+    do, but ideally leave a 1-2 month gap before giving the same brand
+    again (unless there's no other option/inventory available — so this
+    feeds a soft scoring penalty, not a hard filter). recent_boxes is
+    ordered most-recent-first (see load_box_history), so this just takes
+    the first `months_back` entries."""
+    brands = set()
+    for box_prods in recent_boxes[:months_back]:
+        for prod_lower in box_prods:
+            brands.add(get_brand(prod_lower))
+    return brands
+
 def check_frequency_eligibility(cat, product_name, freq, months_since_last):
     """
     Enforces the owner's stated timing rules as a hard gate (not just a
@@ -628,8 +802,21 @@ def check_frequency_eligibility(cat, product_name, freq, months_since_last):
 
     name = product_name.lower()
     if cat == 'Eyes - Mascara':
+        # Only look at the SHADE portion of the name (after the last dash),
+        # not the full product name — otherwise a product LINE name like
+        # "Maybelline Green Edition Mega Mousse Mascara – Very Black (002)"
+        # falsely matches "green" from "Green Edition" and gets treated as
+        # a colored mascara, when the actual shade is black. If there's no
+        # dash, fall back to the full name (rare — better to over- than
+        # under-detect color in that case).
         colors = ['brown', 'purple', 'green', 'blue', 'plum', 'burgundy', 'navy']
-        is_colored = any(c in name for c in colors)
+        for dash in ['–', '—', '-']:
+            if dash in name:
+                shade_part = name.rsplit(dash, 1)[-1]
+                break
+        else:
+            shade_part = name
+        is_colored = ('black' not in shade_part) and any(c in shade_part for c in colors)
         min_gap = 3 if is_colored else 4
     elif freq == 'Often':
         min_gap = 2
@@ -643,7 +830,8 @@ def check_frequency_eligibility(cat, product_name, freq, months_since_last):
                         f"needs at least {min_gap} months for this frequency/category")
     return True, ""
 
-def score_product(p, prefs, freqs, quiz, notes, hard_block, soft_avoid, age):
+def score_product(p, prefs, freqs, quiz, notes, hard_block, soft_avoid, age,
+                   recent_brands=None, discovery_boost_cats=None):
     score = 0
     cat   = p['category']
     name  = p['name'].lower()
@@ -652,11 +840,28 @@ def score_product(p, prefs, freqs, quiz, notes, hard_block, soft_avoid, age):
     if cat in hard_block: score -= 25
     if cat in soft_avoid: score -= 10
 
-    for fk, fc in FREQ_TO_CAT.items():
-        if cat == fc:
-            freq = freqs.get(fk, 'Sometimes')
-            score += FREQ_WEIGHT.get(freq, 1) * 3
-            if freq == 'Rarely': score -= 8
+    freq = get_freq_for_category(cat, freqs)
+    score += FREQ_WEIGHT.get(freq, 1) * 3
+    if freq == 'Rarely': score -= 8
+
+    # Same-brand cross-month cooldown is intentionally NOT scored here.
+    # Testing showed that even a small flat penalty was enough to flip
+    # ranking against genuinely better-matched/better-value picks (it
+    # dragged several boxes from "at target" down into the marginal value
+    # zone) — a bigger side effect than a "nice to have where there's no
+    # real cost" preference should cause. Instead it's applied purely as a
+    # tie-breaker at the sort step in recommend() (see `recent_brands`
+    # usage there): among picks that already score equally well on
+    # everything that matters, prefer the one whose brand wasn't just
+    # given last month or the month before. It never overrides a pick
+    # that's actually better on its own merits.
+
+    # 1-3x/year "discovery" nudge: a small bonus for a category this
+    # customer has genuinely never received before, but ONLY when the
+    # caller has determined she's due for one (see recommend()) — so this
+    # never fires on every box, just occasionally.
+    if discovery_boost_cats and cat in discovery_boost_cats:
+        score += 6
 
     shade_map = {
         'Eyes - Eyeshadow': 'eyeshadow_color',
@@ -703,6 +908,11 @@ def score_product(p, prefs, freqs, quiz, notes, hard_block, soft_avoid, age):
                 if any(kw in name for kw in keywords): score += 5
 
     sc = ' '.join(prefs.get('skin_concerns', [])).lower()
+    # Owner's rule: a customer 35+ who didn't tick "wrinkles" on her quiz
+    # should still be treated as having that concern — assume it rather
+    # than only reacting to what was explicitly selected.
+    if age and age >= 35 and 'wrinkles' not in sc:
+        sc += ' wrinkles'
     if 'oiliness' in sc and any(x in name for x in ['oil', 'pore', 'matte', 'control', 'sebum']): score += 4
     if 'dryness'  in sc and any(x in name for x in ['hydrat', 'moisture', 'repair', 'nourish', 'barrier']): score += 4
     if 'wrinkles' in sc and any(x in name for x in ['retinol', 'anti-age', 'collagen', 'peptide', 'lift']): score += 5
@@ -735,7 +945,8 @@ def score_product(p, prefs, freqs, quiz, notes, hard_block, soft_avoid, age):
     if 'no nail polish' in notes_lower and 'nail' in cat.lower(): score -= 1000
     if 'no elf complexion' in notes_lower:
         if (name.startswith('elf') or name.startswith('e.l.f')) and cat in [
-            'Face - Concealer', 'Face - Foundation', 'Face - Setting Powder']: score -= 1000
+            'Face - Concealer', 'Face - Foundation', 'Face - Setting Powder',
+            'Face - Blush']: score -= 1000
     if 'prefers elf' in notes_lower:
         if name.startswith('elf') or name.startswith('e.l.f'): score += 4
 
@@ -783,6 +994,109 @@ def pick_with_variety(scored_pool, needed, already_used=None, already_brands=Non
             if p not in picked: picked.append(p)
 
     return picked[:needed]
+
+def enforce_often_minimum(results, pool_by_tier, freqs, min_often):
+    """
+    Owner's rule: first-time customers should get at least 3 'Often'
+    products in their box; otherwise, aim for at least 1-2 'Often'
+    products in every box. score_product already weights 'Often' highest,
+    so this is usually satisfied naturally — this is a backstop for the
+    cases where variety/brand/timing constraints crowded Often options
+    out. Swaps the lowest-frequency-weight pick(s) for an eligible Often
+    item from the same already-filtered pool, preferring a brand that
+    isn't already in the box, same as the value optimizer does. Never
+    swaps in anything outside pool_by_tier, so every existing eligibility
+    check (stock, timing, rejected-products, shade rules) still applies.
+    Returns (results, swapped_count).
+    """
+    def often_count(items):
+        return sum(1 for p in items if get_freq_for_category(p['category'], freqs) == 'Often')
+
+    if often_count(results) >= min_often:
+        return results, 0
+
+    swapped = 0
+    current_subcats = {p['category'] for p in results}
+    current_brands  = {get_brand(p['name']) for p in results}
+
+    # Weakest (lowest freq-weight) picks first — those are the best
+    # candidates to give up in favor of an Often item.
+    candidates_to_replace = sorted(
+        results,
+        key=lambda p: FREQ_WEIGHT.get(get_freq_for_category(p['category'], freqs), 1))
+
+    for weak in candidates_to_replace:
+        if often_count(results) >= min_often:
+            break
+        if get_freq_for_category(weak['category'], freqs) == 'Often':
+            continue  # don't cannibalize an Often item to add another Often item
+        tier = weak['tier']
+        pool = pool_by_tier.get(tier, [])
+        base = [p for p in pool
+                if get_freq_for_category(p['category'], freqs) == 'Often'
+                and p['category'] not in current_subcats
+                and p['name'] != weak['name']]
+        if not base:
+            continue
+        brand_safe = [p for p in base if get_brand(p['name']) not in current_brands]
+        options = brand_safe if brand_safe else base
+        best = options[0]
+
+        idx = results.index(weak)
+        results[idx] = best
+        current_subcats.discard(weak['category']); current_subcats.add(best['category'])
+        current_brands.discard(get_brand(weak['name'])); current_brands.add(get_brand(best['name']))
+        swapped += 1
+
+    return results, swapped
+
+def enforce_no_brand_duplicates(results, pool_by_tier, freqs):
+    """
+    Final safety net, run after every other selection/swap stage. Owner's
+    rule is absolute: the same brand cannot appear twice in one box. Every
+    earlier stage (pick_with_variety's fallback passes, the often-minimum
+    swap, the value optimizer) already tries to respect this, but each has
+    its own last-resort fallback that can ignore brand safety if it thinks
+    there's no other option — and those fallbacks don't know about each
+    other's choices. This pass checks the FINAL box as a whole and fixes
+    any collision that slipped through, keeping the higher-priority item
+    (by Often > Sometimes > Rarely) and swapping the other for a genuinely
+    brand-safe alternative. Returns (results, changed_count).
+    """
+    changed = 0
+    brand_positions = {}
+    for i, p in enumerate(results):
+        brand_positions.setdefault(get_brand(p['name']), []).append(i)
+
+    for brand, idxs in brand_positions.items():
+        if len(idxs) < 2:
+            continue
+        idxs_sorted = sorted(
+            idxs,
+            key=lambda i: -FREQ_WEIGHT.get(get_freq_for_category(results[i]['category'], freqs), 1))
+        for i in idxs_sorted[1:]:  # keep idxs_sorted[0], fix the rest
+            weak = results[i]
+            tier = weak['tier']
+            current_brands   = {get_brand(p['name']) for j, p in enumerate(results) if j != i}
+            current_subcats  = {p['category'] for j, p in enumerate(results) if j != i}
+            same_cat = [p for p in pool_by_tier.get(tier, [])
+                        if p['category'] == weak['category']
+                        and p['name'] != weak['name']
+                        and get_brand(p['name']) not in current_brands]
+            if same_cat:
+                results[i] = same_cat[0]
+                changed += 1
+                continue
+            any_cat = [p for p in pool_by_tier.get(tier, [])
+                       if p['category'] not in current_subcats
+                       and get_brand(p['name']) not in current_brands]
+            if any_cat:
+                results[i] = any_cat[0]
+                changed += 1
+            # else: genuinely no brand-safe stock left in this tier — leave
+            # as-is (rare; caller's warnings should flag low-stock tiers).
+
+    return results, changed
 
 def get_received_with_dates(cid, box_timeline):
     """Returns [(product_name, month_str), ...] for everything a customer
@@ -850,6 +1164,8 @@ def get_next_swap_alternative(cid, category, tier, already_rejected_names,
 
     rejected_lower = {n.lower().strip() for n in already_rejected_names}
     in_box_lower = {n.lower().strip() for n in current_box_names}
+    rejected_for_cust = load_rejected_products().get(cid, set())
+    blocked_brands_for_cust = load_blocked_brands().get(cid, set())
 
     candidates = []
     for p in inventory:
@@ -862,11 +1178,14 @@ def get_next_swap_alternative(cid, category, tier, already_rejected_names,
         nm = p['name'].lower().strip()
         if nm in rejected_lower or nm in in_box_lower:
             continue
+        if nm in rejected_for_cust:
+            continue
+        if get_brand(p['name']) in blocked_brands_for_cust:
+            continue
         if not check_product_eligibility(p['name'], received_with_dates, target_month_str)[0]:
             continue
-        freq_key = next((fk for fk, fc in FREQ_TO_CAT.items() if fc == category), '')
         gap, _ = get_category_time_gap(cid, category, box_timeline, inv_cat_map)
-        if not check_frequency_eligibility(category, p['name'], freqs.get(freq_key, 'Sometimes'), gap)[0]:
+        if not check_frequency_eligibility(category, p['name'], get_freq_for_category(category, freqs), gap)[0]:
             continue
         if 'no nail' in notes.lower() and 'nail' in category.lower():
             continue
@@ -921,6 +1240,8 @@ def get_next_alternative(customer_name, category, tier, already_rejected,
     quiz = load_quiz().get(cid, {})
     age = get_age(cust.get('birthday', ''))
     hard_block, soft_avoid = get_recent_subcats(recent, inv_cat_map)
+    rejected_for_cust = load_rejected_products().get(cid, set())
+    blocked_brands_for_cust = load_blocked_brands().get(cid, set())
 
     target_month = TARGET_MONTH if TARGET_MONTH else datetime.now().strftime('%Y-%m')
     already_rejected_lower = {r.lower().strip() for r in (already_rejected or [])}
@@ -935,11 +1256,14 @@ def get_next_alternative(customer_name, category, tier, already_rejected,
             continue
         if p['name'].lower().strip() in already_rejected_lower:
             continue
+        if p['name'].lower().strip() in rejected_for_cust:
+            continue
+        if get_brand(p['name']) in blocked_brands_for_cust:
+            continue
         if not check_product_eligibility(p['name'], received_with_dates, target_month)[0]:
             continue
-        freq_key = next((fk for fk, fc in FREQ_TO_CAT.items() if fc == category), '')
         if not check_frequency_eligibility(
-                category, p['name'], freqs.get(freq_key, 'Sometimes'),
+                category, p['name'], get_freq_for_category(category, freqs),
                 get_category_time_gap(cid, category, box_timeline, inv_cat_map)[0])[0]:
             continue
         if get_brand(p['name']) in current_brands:
@@ -964,6 +1288,8 @@ def recommend(customer_name, box_type_override=None):
     freqs_all  = load_frequencies()
     quiz_all   = load_quiz()
     inventory  = load_inventory()
+    rejected_all = load_rejected_products()
+    blocked_brands_all = load_blocked_brands()
 
     inv_cat_map = {p['name'].lower(): p['category'] for p in inventory}
 
@@ -994,6 +1320,25 @@ def recommend(customer_name, box_type_override=None):
 
     hard_block, soft_avoid = get_recent_subcats(recent, inv_cat_map)
     history_pattern, total_products = get_history_pattern(cid, timeline, inv_cat_map)
+    rejected_for_cust = rejected_all.get(cid, set())
+    blocked_brands_for_cust = blocked_brands_all.get(cid, set())
+
+    # Owner's rule: first-time customers should get at least 3 'Often'
+    # products; everyone else, at least 1-2 per box.
+    is_first_time = len(timeline.get(cid, [])) == 0
+    min_often = 3 if is_first_time else 1
+
+    # Owner's rule: same brand across different months is fine, but ideally
+    # a 1-2 month gap before repeating — soft nudge only, never a hard block.
+    recent_brands = get_recent_brands(recent, months_back=2)
+
+    # "Discovery" products (owner's rule: 1-3x/year, give something outside
+    # her usual pattern) — DISABLED by owner's request (2026-10). She'd
+    # rather choose these herself during monthly review than have the
+    # engine guess at them automatically. The machinery (load_discovery_log,
+    # discovery_eligible) is left in place, unused, in case she wants an
+    # automated version later — it just never gets called from here.
+    discovery_boost_cats = None
 
     results, warnings = [], []
     used_subcats_global = []
@@ -1007,10 +1352,12 @@ def recommend(customer_name, box_type_override=None):
         pool = [p for p in inventory
                 if p['tier'] == tier
                 and (p['stock'] - _allocated_this_cycle.get(p['name'].lower(), 0)) >= 1
+                and p['name'].lower().strip() not in rejected_for_cust
+                and get_brand(p['name']) not in blocked_brands_for_cust
                 and check_product_eligibility(p['name'], received_with_dates, target_month)[0]
                 and check_frequency_eligibility(
                         p['category'], p['name'],
-                        freqs.get(next((fk for fk,fc in FREQ_TO_CAT.items() if fc==p['category']), ''), 'Sometimes'),
+                        get_freq_for_category(p['category'], freqs),
                         get_category_time_gap(cid, p['category'], timeline, inv_cat_map)[0]
                     )[0]
                 and not ('no nail' in notes.lower() and 'nail' in p['category'].lower())
@@ -1018,15 +1365,25 @@ def recommend(customer_name, box_type_override=None):
                          and (p['name'].lower().startswith('elf') or
                               p['name'].lower().startswith('e.l.f'))
                          and p['category'] in ['Face - Concealer',
-                             'Face - Foundation', 'Face - Setting Powder'])]
+                             'Face - Foundation', 'Face - Setting Powder',
+                             'Face - Blush'])]
         pool_by_tier[tier] = pool
 
         if len(pool) < needed:
             warnings.append(f"⚠️ Only {len(pool)} eligible {tier} products (need {needed})")
 
+        # Brand cross-month cooldown as a pure tie-breaker: sort primarily
+        # by score (descending), and only among equal scores prefer a
+        # brand that wasn't in the last 1-2 months' box. This matches the
+        # owner's actual rule ("ideally... unless there's no other option")
+        # without ever letting the cooldown preference beat a pick that's
+        # genuinely better on its own merits.
         scored = sorted(pool,
-                        key=lambda p: score_product(p, prefs, freqs, quiz,
-                                                    notes, hard_block, soft_avoid, age),
+                        key=lambda p: (
+                            score_product(p, prefs, freqs, quiz, notes,
+                                          hard_block, soft_avoid, age,
+                                          discovery_boost_cats=discovery_boost_cats),
+                            0 if get_brand(p['name']) not in recent_brands else -1),
                         reverse=True)
 
         picked = pick_with_variety(scored, needed,
@@ -1041,6 +1398,12 @@ def recommend(customer_name, box_type_override=None):
 
         results.extend(picked)
 
+    results, often_swapped = enforce_often_minimum(results, pool_by_tier, freqs, min_often)
+    if often_swapped:
+        warnings.append(f"ℹ️ Swapped {often_swapped} pick(s) to meet the "
+                         f"{'first-time (3+)' if is_first_time else 'standard (1+)'} "
+                         f"'Often' minimum for this box.")
+
     results, value_summary = optimize_box_value(results, pool_by_tier, box_type)
     value_summary['selling_price'] = get_selling_price(box_type, cust.get('cadence', 'Monthly'))
     if not value_summary['met_target'] and not value_summary.get('marginal'):
@@ -1048,6 +1411,31 @@ def recommend(customer_name, box_type_override=None):
                          f"AED {value_summary['target']} target for {box_type} "
                          f"(short by AED {value_summary['gap']}) — not enough higher-value "
                          f"eligible stock to close the gap without breaking other rules.")
+
+    # Final absolute check: no matter which earlier stage's fallback caused
+    # it, the same brand must never appear twice in one box.
+    results, brand_fixes = enforce_no_brand_duplicates(results, pool_by_tier, freqs)
+    if brand_fixes:
+        warnings.append(f"ℹ️ Fixed {brand_fixes} same-brand-twice collision(s) introduced by an "
+                         f"earlier swap step.")
+        new_total = sum(p.get('retail_price_aed') or 0 for p in results)
+        value_summary['total_retail'] = round(new_total, 2)
+        value_summary['met_target'] = new_total >= value_summary['target'] if value_summary['target'] else None
+        if value_summary['target']:
+            value_summary['gap'] = round(value_summary['target'] - new_total, 2) if not value_summary['met_target'] else 0
+
+    # Did a genuine discovery pick survive into the final box? (value
+    # optimization can swap items out, so check against the final results,
+    # not just what was scored toward.) The caller is responsible for
+    # writing this to the discovery_log sheet once the box is approved —
+    # recommend() only reads that log, it doesn't write to it.
+    value_summary['is_first_time'] = is_first_time
+    value_summary['discovery_pick'] = None
+    if discovery_boost_cats:
+        for p in results:
+            if p['category'] in discovery_boost_cats:
+                value_summary['discovery_pick'] = {'name': p['name'], 'category': p['category']}
+                break
 
     return (cust, results, warnings, received, ratio,
             recent, hard_block, soft_avoid, history_pattern,
@@ -1095,9 +1483,16 @@ def build_explanation(p, cid, hard_block, soft_avoid, history_pattern,
             sentences.append(f"{grp} is underrepresented in her history (only {grp_count} of {total_products} products sent) — a good opportunity to add variety.")
 
     sc = ' '.join(prefs.get('skin_concerns', [])).lower()
+    assumed_wrinkles = False
+    if age and age >= 35 and 'wrinkles' not in sc:
+        sc += ' wrinkles'
+        assumed_wrinkles = True
     hair_concerns = prefs.get('hair_concerns', [])
     if 'wrinkles' in sc and any(x in name for x in ['retinol', 'collagen', 'peptide', 'lift']):
-        sentences.append("Matches her skin concern: wrinkles & fine lines.")
+        if assumed_wrinkles:
+            sentences.append("Assumed wrinkles/fine lines as a concern based on her age, since she's 35+ and didn't select it on her quiz.")
+        else:
+            sentences.append("Matches her skin concern: wrinkles & fine lines.")
     elif 'acne' in sc and any(x in name for x in ['acne', 'blemish', 'tea tree', 'clarify']):
         sentences.append("Addresses her acne and blemish concerns.")
     elif 'dryness' in sc and any(x in name for x in ['hydrat', 'moisture', 'repair', 'barrier']):

@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snatched Beauty Box — Dashboard</title>
+<style>
+  :root{
+    --pink:#C27BA0;
+    --pink-dark:#a85f85;
+    --purple:#B4A7D6;
+    --purple-dark:#8b7ab8;
+    --peach:#FCE5CD;
+    --peach-dark:#f5c896;
+    --ink:#3a2f38;
+    --muted:#8a7a85;
+    --line:#ecdfe6;
+    --bg:#fdf9fb;
+    --card:#ffffff;
+    --green:#4a9d6f;
+    --green-bg:#e7f5ed;
+    --amber:#c98a1f;
+    --amber-bg:#fdf1dd;
+    --red:#c0506a;
+    --red-bg:#fbe9ee;
+    --radius:14px;
+    --shadow: 0 2px 10px rgba(120,60,90,0.07), 0 1px 2px rgba(120,60,90,0.05);
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased;
+  }
+  .mock-banner{
+    background:var(--ink); color:#fff; text-align:center; font-size:12.5px; padding:7px 12px;
+    letter-spacing:.02em;
+  }
+  .mock-banner b{color:var(--peach);}
+
+  /* ---- top nav ---- */
+  header.topnav{
+    background:linear-gradient(135deg, var(--pink) 0%, var(--purple) 100%);
+    padding:14px 28px; display:flex; align-items:center; gap:24px; flex-wrap:wrap;
+  }
+  .brand{ display:flex; align-items:center; gap:10px; color:#fff; font-weight:700; font-size:17px; }
+  .brand-dot{ width:10px;height:10px;border-radius:50%;background:#fff; }
+  nav.tabs{ display:flex; gap:6px; margin-left:8px; }
+  nav.tabs button{
+    background:rgba(255,255,255,0.16); border:1px solid rgba(255,255,255,0.3); color:#fff;
+    padding:8px 16px; border-radius:999px; font-size:13.5px; font-weight:600; cursor:pointer;
+    transition:.15s;
+  }
+  nav.tabs button:hover{ background:rgba(255,255,255,0.28); }
+  nav.tabs button.active{ background:#fff; color:var(--pink-dark); }
+  .search-wrap{ margin-left:auto; position:relative; min-width:260px; }
+  .search-wrap input{
+    width:100%; padding:9px 14px 9px 36px; border-radius:999px; border:none; font-size:13.5px;
+    background:rgba(255,255,255,0.92); outline:none;
+  }
+  .search-wrap .icon{ position:absolute; left:13px; top:50%; transform:translateY(-50%); color:var(--pink-dark); font-size:13px; }
+
+  main{ max-width:1080px; margin:0 auto; padding:28px 24px 80px; }
+  .page{ display:none; animation:fade .2s ease; }
+  .page.active{ display:block; }
+  @keyframes fade{ from{opacity:0; transform:translateY(4px);} to{opacity:1; transform:translateY(0);} }
+
+  h1.page-title{ font-size:22px; margin:0 0 4px; }
+  p.page-sub{ color:var(--muted); margin:0 0 22px; font-size:14px; }
+
+  /* ---- home stat cards ---- */
+  .stat-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin-bottom:28px; }
+  .stat-card{
+    background:var(--card); border-radius:var(--radius); padding:18px 20px; box-shadow:var(--shadow);
+    border-left:4px solid var(--pink); cursor:pointer; transition:.15s;
+  }
+  .stat-card:hover{ transform:translateY(-2px); box-shadow:0 6px 18px rgba(120,60,90,0.12); }
+  .stat-card.purple{ border-left-color:var(--purple); }
+  .stat-card.amber{ border-left-color:var(--amber); }
+  .stat-card.green{ border-left-color:var(--green); }
+  .stat-num{ font-size:28px; font-weight:800; }
+  .stat-label{ font-size:13px; color:var(--muted); margin-top:2px; }
+
+  .panel{ background:var(--card); border-radius:var(--radius); padding:20px 22px; box-shadow:var(--shadow); margin-bottom:20px; }
+  .panel h3{ margin:0 0 14px; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .row-line{ display:flex; justify-content:space-between; align-items:center; padding:9px 0; border-bottom:1px solid var(--line); font-size:13.5px; }
+  .row-line:last-child{ border-bottom:none; }
+  .pill{ font-size:11.5px; font-weight:700; padding:3px 10px; border-radius:999px; }
+  .pill.red{ background:var(--red-bg); color:var(--red); }
+  .pill.amber{ background:var(--amber-bg); color:var(--amber); }
+  .pill.green{ background:var(--green-bg); color:var(--green); }
+
+  /* ---- review page ---- */
+  .month-controls{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; flex-wrap:wrap; gap:12px;}
+  .progress-track{ background:var(--line); border-radius:999px; height:8px; width:220px; overflow:hidden;}
+  .progress-fill{ background:linear-gradient(90deg,var(--pink),var(--purple)); height:100%; border-radius:999px; transition:.3s;}
+  .commit-btn{
+    background:var(--ink); color:#fff; border:none; padding:12px 22px; border-radius:10px;
+    font-size:14px; font-weight:700; cursor:pointer; opacity:.4; pointer-events:none; transition:.2s;
+  }
+  .commit-btn.ready{ opacity:1; pointer-events:auto; background:var(--green); }
+  .commit-btn.ready:hover{ background:#3d8760; }
+
+  .cust-card{ background:var(--card); border-radius:var(--radius); box-shadow:var(--shadow); margin-bottom:16px; overflow:hidden; }
+  .cust-head{ padding:16px 20px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; background:linear-gradient(135deg,#fbf2f6,#f5f2fb); }
+  .cust-name{ font-weight:700; font-size:15.5px; }
+  .cust-meta{ font-size:12.5px; color:var(--muted); margin-top:2px; }
+  .tier-badge{ font-size:11px; font-weight:700; padding:4px 10px; border-radius:999px; background:var(--purple); color:#fff; }
+  .box-total{ font-size:13px; font-weight:700; }
+
+  .item-row{ display:grid; grid-template-columns:28px 1fr auto; gap:12px; align-items:center; padding:13px 20px; border-top:1px solid var(--line); }
+  .item-row.approved{ background:var(--green-bg); }
+  .item-num{ color:var(--muted); font-weight:700; font-size:13px; }
+  .item-name{ font-weight:600; font-size:13.8px; }
+  .item-sub{ font-size:12px; color:var(--muted); margin-top:3px; }
+  .item-why{ font-size:11.8px; color:#9c8a95; margin-top:4px; line-height:1.4; max-width:520px; }
+  .item-actions{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:flex-end; max-width:260px; }
+  .btn{ border:none; padding:7px 13px; border-radius:8px; font-size:12.5px; font-weight:700; cursor:pointer; transition:.15s; white-space:nowrap;}
+  .btn-swap{ background:var(--peach); color:#8a5a24; }
+  .btn-swap:hover{ background:var(--peach-dark); }
+  .btn-approve{ background:var(--pink); color:#fff; }
+  .btn-approve:hover{ background:var(--pink-dark); }
+  .btn-undo{ background:#fff; color:var(--muted); border:1px solid var(--line); }
+  .btn-danger-outline{ background:#fff; color:var(--red); border:1px solid var(--red); }
+  .btn-danger-outline:hover{ background:var(--red-bg); }
+  .btn-outline{ background:#fff; color:var(--green); border:1px solid var(--green); }
+  .btn-outline:hover{ background:var(--green-bg); }
+  .btn-undo:hover{ background:#f7f0f4; }
+  .approved-tag{ font-size:11.5px; font-weight:700; color:var(--green); display:flex; align-items:center; gap:5px; }
+
+  .swap-flash{ font-size:11px; color:var(--pink-dark); font-weight:700; margin-top:4px; display:none; }
+  .swap-flash.show{ display:block; }
+
+  .cust-footer{ padding:10px 20px; font-size:12px; color:var(--muted); border-top:1px solid var(--line); background:#fbfafc; }
+
+  /* ---- customer search page ---- */
+  .search-hero{ text-align:center; padding:10px 0 26px; }
+  .big-search{ max-width:480px; margin:0 auto; position:relative; }
+  .big-search input{
+    width:100%; padding:14px 18px 14px 44px; border-radius:12px; border:1.5px solid var(--line);
+    font-size:15px; outline:none; box-shadow:var(--shadow);
+  }
+  .big-search input:focus{ border-color:var(--pink); }
+  .big-search .icon{ position:absolute; left:16px; top:50%; transform:translateY(-50%); color:var(--muted); }
+  .suggest-row{ display:flex; gap:8px; justify-content:center; margin-top:12px; flex-wrap:wrap; }
+  .suggest-chip{ background:var(--card); border:1px solid var(--line); padding:6px 14px; border-radius:999px; font-size:12.5px; cursor:pointer; }
+  .suggest-chip:hover{ background:var(--peach); }
+
+  .profile-card{ display:none; }
+  .profile-card.show{ display:block; }
+  .profile-head{ display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:16px; margin-bottom:18px;}
+  .profile-name{ font-size:20px; font-weight:800; }
+  .profile-meta{ color:var(--muted); font-size:13px; margin-top:4px; }
+  .birthday-flag{ background:var(--peach); color:#8a5a24; font-size:12px; font-weight:700; padding:5px 12px; border-radius:999px; display:inline-flex; align-items:center; gap:5px; margin-top:8px;}
+
+  .tag-group{ display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; }
+  .tag{ background:#f5eef2; color:var(--pink-dark); font-size:11.8px; font-weight:600; padding:5px 11px; border-radius:999px; }
+
+  .check-box{ background:#fbf2f6; border:1.5px dashed var(--pink); border-radius:12px; padding:16px 18px; margin:18px 0; }
+  .check-box label{ font-size:13px; font-weight:700; display:block; margin-bottom:8px; }
+  .check-row{ display:flex; gap:8px; }
+  .check-row input{ flex:1; padding:10px 14px; border-radius:8px; border:1px solid var(--line); font-size:13.5px; outline:none;}
+  .check-row button{ background:var(--pink); color:#fff; border:none; padding:10px 18px; border-radius:8px; font-weight:700; font-size:13px; cursor:pointer; }
+  .check-result{ margin-top:12px; font-size:13.5px; font-weight:600; padding:10px 14px; border-radius:8px; display:none; }
+  .check-result.show{ display:block; }
+  .check-result.yes{ background:var(--red-bg); color:var(--red); }
+  .check-result.no{ background:var(--green-bg); color:var(--green); }
+
+  .history-month{ margin-bottom:14px; }
+  .history-month-label{ font-size:12.5px; font-weight:700; color:var(--purple-dark); margin-bottom:6px; text-transform:uppercase; letter-spacing:.03em;}
+  .history-items{ display:flex; flex-wrap:wrap; gap:7px; }
+  .history-item{ background:var(--bg); border:1px solid var(--line); font-size:12px; padding:6px 11px; border-radius:8px; }
+  .history-item.current{ border-color:var(--pink); background:#fbf2f6; font-weight:700; }
+
+  .empty-note{ text-align:center; color:var(--muted); font-size:13.5px; padding:30px 0; }
+  footer.foot{ text-align:center; color:var(--muted); font-size:12px; padding:26px 0 10px; }
+
+  /* ---- history icon on review rows ---- */
+  .history-link{ background:none; border:1px solid var(--purple); color:var(--purple-dark); font-size:11px; font-weight:700; padding:4px 10px; border-radius:999px; cursor:pointer; display:inline-flex; align-items:center; gap:4px; }
+  .history-link:hover{ background:var(--purple); color:#fff; }
+
+  /* ---- manual entry ---- */
+  .manual-toggle{ background:#fff; color:var(--purple-dark); border:1px solid var(--purple); }
+  .manual-toggle:hover{ background:var(--purple); color:#fff; }
+  .cat-select{ background:#fff; color:#8a5a24; border:1px solid var(--peach-dark); font-size:12.5px; font-weight:700; padding:7px 10px; border-radius:8px; cursor:pointer; }
+  .cat-select:hover{ background:var(--peach); }
+  .cat-warning{ background:var(--amber-bg); color:var(--amber); font-size:11.8px; font-weight:600; padding:8px 12px; border-radius:8px; margin-top:8px; display:none; grid-column:1/-1; }
+  .cat-warning.show{ display:block; }
+  .manual-panel{ grid-column:1/-1; background:#f7f5fb; border:1px dashed var(--purple); border-radius:10px; padding:12px 14px; margin-top:4px; display:none; }
+  .manual-panel.open{ display:block; }
+  .manual-panel input{ width:100%; padding:9px 12px; border-radius:8px; border:1px solid var(--line); font-size:13px; outline:none; margin-bottom:8px;}
+  .manual-panel input:focus{ border-color:var(--purple); }
+  .manual-results{ max-height:220px; overflow-y:auto; }
+  .manual-result{ display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-radius:8px; font-size:12.5px; cursor:pointer; }
+  .manual-result:hover{ background:#ece7f7; }
+  .manual-result .mr-name{ font-weight:600; }
+  .manual-result .mr-meta{ color:var(--muted); font-size:11.5px; }
+  .manual-warning{ background:var(--amber-bg); color:var(--amber); font-size:11.8px; font-weight:600; padding:8px 12px; border-radius:8px; margin-top:8px; display:none; }
+  .manual-warning.show{ display:block; }
+  .manual-ok{ background:var(--green-bg); color:var(--green); font-size:11.8px; font-weight:600; padding:8px 12px; border-radius:8px; margin-top:8px; display:none; }
+  .manual-ok.show{ display:block; }
+  .owner-picked-tag{ font-size:10.5px; font-weight:700; color:var(--purple-dark); background:#ece7f7; padding:2px 8px; border-radius:999px; margin-left:6px; }
+
+  /* ---- slide-over drawer ---- */
+  .drawer-backdrop{ position:fixed; inset:0; background:rgba(40,20,35,0.35); opacity:0; pointer-events:none; transition:.2s; z-index:40; }
+  .drawer-backdrop.open{ opacity:1; pointer-events:auto; }
+  .drawer{ position:fixed; top:0; right:0; height:100%; width:min(620px,92vw); background:var(--bg); z-index:41;
+    box-shadow:-8px 0 30px rgba(40,20,35,0.18); transform:translateX(100%); transition:.25s ease; overflow-y:auto; }
+  .drawer.open{ transform:translateX(0); }
+  .drawer-head{ position:sticky; top:0; background:linear-gradient(135deg, var(--pink) 0%, var(--purple) 100%); padding:16px 22px; display:flex; justify-content:space-between; align-items:center; z-index:2;}
+  .drawer-head span{ color:#fff; font-weight:700; font-size:14px; }
+  .drawer-close{ background:rgba(255,255,255,0.25); border:none; color:#fff; width:30px; height:30px; border-radius:50%; cursor:pointer; font-size:15px; }
+  .drawer-close:hover{ background:rgba(255,255,255,0.4); }
+  .drawer-body{ padding:20px 22px 60px; }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="brand"><span class="brand-dot"></span> Snatched Beauty Box</div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-page="home">Home</button>
+    <button class="tab-btn" data-page="review">This Month</button>
+    <button class="tab-btn" data-page="customers">Customers</button>
+  </nav>
+  <div class="search-wrap">
+    <span class="icon">🔍</span>
+    <input id="globalSearch" placeholder="Search any customer…" onkeydown="if(event.key==='Enter'){openDrawer(this.value)}">
+  </div>
+  <form method="POST" action="/dashboard/logout" style="margin:0;">
+    <button type="submit" class="btn btn-undo" style="background:rgba(255,255,255,0.2); color:#fff; border-color:rgba(255,255,255,0.4);">Log out</button>
+  </form>
+</header>
+
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span>👤 Customer history</span>
+    <button class="drawer-close" onclick="closeDrawer()">✕</button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+</div>
+
+<main>
+
+  <!-- ============ HOME ============ -->
+  <div class="page active" id="page-home">
+    <h1 class="page-title">Good morning, Iqra 👋</h1>
+    <p class="page-sub">Here's everything that needs your eyes today — nothing else.</p>
+
+    <div class="stat-grid">
+      <div class="stat-card" onclick="showPage('review')">
+        <div class="stat-num" id="homeReviewCount">—</div>
+        <div class="stat-label">boxes to review this month</div>
+      </div>
+      <div class="stat-card purple" onclick="showPage('review')">
+        <div class="stat-num" id="homeApprovedCount">—</div>
+        <div class="stat-label">approved so far</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-num" id="homeCommittedCount">—</div>
+        <div class="stat-label">committed this session</div>
+      </div>
+      <div class="stat-card amber">
+        <div class="stat-num" id="homeLowStockCount">—</div>
+        <div class="stat-label">categories critically low on stock</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-num" id="homeBirthdayCount">—</div>
+        <div class="stat-label">birthday this month</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>📋 This month's board</h3>
+      <div class="row-line"><span id="monthStatusLine">Loading…</span></div>
+      <div class="row-line" style="gap:8px;flex-wrap:wrap;">
+        <input id="monthInput" type="month" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;" onchange="loadHomeStats()">
+        <button class="btn btn-approve" onclick="generateMonth(false)">Generate this month's boxes</button>
+      </div>
+      <div class="manual-warning" id="genWarning" style="display:none;"></div>
+    </div>
+
+    <div class="panel" id="birthdaysPanel" style="display:none;">
+      <h3>🎂 Birthdays this month</h3>
+      <div id="birthdaysList"></div>
+    </div>
+
+    <div class="panel" id="lowStockPanel" style="display:none;">
+      <h3>⚠️ Running low on stock</h3>
+      <div id="lowStockList"></div>
+    </div>
+
+    <div class="panel">
+      <h3>✅ Quick actions</h3>
+      <div class="row-line"><span>Review & approve this month's boxes</span><button class="btn btn-approve" onclick="showPage('review')">Go to review →</button></div>
+      <div class="row-line"><span>Check a customer's history before deciding a swap</span><button class="btn btn-swap" onclick="showPage('customers')">Search a customer →</button></div>
+      <div class="row-line"><span>See everything at once — every customer, every box, full inventory</span><a class="btn btn-undo" href="/dashboard/download_workbook" style="text-decoration:none;">Download full spreadsheet ↓</a></div>
+    </div>
+  </div>
+
+  <!-- ============ REVIEW ============ -->
+  <div class="page" id="page-review">
+    <h1 class="page-title">This month's boxes</h1>
+    <p class="page-sub">Swap what doesn't fit, approve what does. Everything updates instantly — no typing into cells.</p>
+
+    <div class="month-controls">
+      <div>
+        <div style="font-size:13px;font-weight:700;margin-bottom:6px;" id="progressLabel">0 of 0 approved</div>
+        <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+      </div>
+      <button class="commit-btn" id="commitBtn" onclick="tryCommit()">Commit Month →</button>
+    </div>
+
+    <div id="custList"></div>
+    <div class="empty-note" id="reviewEmptyNote" style="display:none;">Nothing on the board yet — generate this month's boxes from the Home tab first.</div>
+  </div>
+
+  <!-- ============ CUSTOMERS ============ -->
+  <div class="page" id="page-customers">
+    <h1 class="page-title">Find a customer</h1>
+    <p class="page-sub">One search. Her whole history, preferences, and current box — no switching tabs.</p>
+
+    <div class="search-hero">
+      <div class="big-search">
+        <span class="icon">🔍</span>
+        <input id="custSearch" placeholder="Type a customer's name…" oninput="filterSuggest(this.value)" onkeydown="if(event.key==='Enter'){goSearch(this.value)}">
+      </div>
+      <div class="suggest-row" id="suggestRow"></div>
+    </div>
+
+    <div id="profileArea"></div>
+  </div>
+
+</main>
+
+<script>
+/* ================= real data layer — everything below calls the live
+   Flask endpoints. No static/sample data anywhere in this file. ================= */
+
+let boardCustomers = [];      // from /dashboard/state
+let allCustomersList = null;  // from /dashboard/all_customers — every customer on file,
+                               // not just whoever's on the currently loaded month's board
+let inventoryCatalog = null;  // fetched lazily on first manual-search use
+let currentMonth = null;
+
+async function ensureAllCustomers(){
+  if(allCustomersList) return allCustomersList;
+  const data = await api('/dashboard/all_customers');
+  allCustomersList = (data && data.customers) || [];
+  return allCustomersList;
+}
+
+async function api(path, opts){
+  const res = await fetch(path, Object.assign({credentials:'same-origin'}, opts||{}));
+  if(res.status === 401){ window.location.href = '/dashboard/login'; return null; }
+  let data = null;
+  try{ data = await res.json(); } catch(e){}
+  if(!res.ok && data && !data.hasOwnProperty('found')){
+    throw new Error((data && data.error) || `Request to ${path} failed (${res.status})`);
+  }
+  return data;
+}
+function postForm(path, fields){
+  const body = new URLSearchParams(fields);
+  return api(path, {method:'POST', body});
+}
+
+/* ---------------- nav ---------------- */
+function showPage(p){
+  document.querySelectorAll('.page').forEach(el=>el.classList.remove('active'));
+  document.getElementById('page-'+p).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  const btn = document.querySelector(`.tab-btn[data-page="${p}"]`);
+  if(btn) btn.classList.add('active');
+  if(p === 'customers') filterSuggest(document.getElementById('custSearch').value || '');
+}
+document.querySelectorAll('.tab-btn').forEach(b=>b.addEventListener('click', ()=>showPage(b.dataset.page)));
+
+/* ---------------- load board ---------------- */
+async function loadBoard(){
+  const data = await api('/dashboard/state');
+  if(!data) return;
+  boardCustomers = data.customers || [];
+  if(boardCustomers.length){
+    currentMonth = boardCustomers[0].month;
+    document.getElementById('monthInput').value = currentMonth;
+  }
+  renderReview();
+  renderHome();
+}
+
+function renderHome(){
+  const total = boardCustomers.length;
+  const approved = boardCustomers.filter(c => c.items.length && c.items.every(i=>i.status==='Approved')).length;
+  document.getElementById('homeReviewCount').textContent = total;
+  document.getElementById('homeApprovedCount').textContent = `${approved} / ${total}`;
+  document.getElementById('monthStatusLine').textContent = total
+    ? `${total} customer${total===1?'':'s'} on the board for ${currentMonth||'this month'} — ${approved} fully approved.`
+    : 'Nothing generated yet for this month.';
+  loadHomeStats();
+}
+
+async function loadHomeStats(){
+  const monthVal = document.getElementById('monthInput').value || currentMonth;
+  const url = '/dashboard/home_stats' + (monthVal ? '?target_month=' + encodeURIComponent(monthVal) : '');
+  const data = await api(url);
+  if(!data || data.error) return;
+
+  const birthdays = data.birthdays || [];
+  document.getElementById('homeBirthdayCount').textContent = birthdays.length;
+  const bPanel = document.getElementById('birthdaysPanel');
+  const bList = document.getElementById('birthdaysList');
+  if(birthdays.length){
+    bPanel.style.display = '';
+    bList.innerHTML = birthdays.map(b => `
+      <div class="row-line"><span>${b.name} — ${b.birthday}</span><span class="pill green">customer since ${b.subscribed_since || '—'}</span></div>
+    `).join('');
+  } else {
+    bPanel.style.display = 'none';
+  }
+
+  const lowStock = data.low_stock_categories || [];
+  document.getElementById('homeLowStockCount').textContent = lowStock.length;
+  const lsPanel = document.getElementById('lowStockPanel');
+  const lsList = document.getElementById('lowStockList');
+  if(lowStock.length){
+    lsPanel.style.display = '';
+    lsList.innerHTML = `<div style="font-size:11.5px;color:var(--muted);margin-bottom:6px;">${data.low_stock_threshold} or fewer units left, across every product in the category.</div>` +
+      lowStock.map(l => `
+        <div class="row-line"><span>${l.category}</span><span class="pill red">${l.total_stock} left</span></div>
+      `).join('');
+  } else {
+    lsPanel.style.display = 'none';
+  }
+}
+
+async function generateMonth(force){
+  const monthVal = document.getElementById('monthInput').value; // "YYYY-MM"
+  if(!monthVal){ alert('Pick a month first.'); return; }
+  const warnEl = document.getElementById('genWarning');
+  warnEl.style.display = 'none';
+  try{
+    const fields = {target_month: monthVal};
+    if(force) fields.force = 'true';
+    const res = await postForm('/dashboard/generate_month', fields);
+    if(!res) return;
+    if(res.error && res.unfinished_customers){
+      const proceed = confirm(
+        `These customers still have unfinished work from before: ${res.unfinished_customers.join(', ')}.\n\n` +
+        `Generating again will replace it. Continue?`
+      );
+      if(proceed) return generateMonth(true);
+      return;
+    }
+    if(res.error){ warnEl.textContent = '⚠ ' + res.error; warnEl.style.display='block'; return; }
+    await loadBoard();
+    showPage('review');
+  }catch(e){
+    warnEl.textContent = '⚠ ' + e.message;
+    warnEl.style.display = 'block';
+  }
+}
+
+/* ---------------- review page ---------------- */
+function rowKey(rowNumber){ return 'row-'+rowNumber; }
+
+function renderReview(){
+  const wrap = document.getElementById('custList');
+  const emptyNote = document.getElementById('reviewEmptyNote');
+  wrap.innerHTML = '';
+  emptyNote.style.display = boardCustomers.length ? 'none' : 'block';
+
+  let approvedTotal = 0;
+  boardCustomers.forEach(cust=>{
+    const approvedHere = cust.items.filter(i=>i.status==='Approved').length;
+    if(approvedHere === cust.items.length && cust.items.length) approvedTotal += 1;
+
+    const totalPrice = cust.items.reduce((s,i)=> s + (Number(i.price)||0), 0);
+
+    const card = document.createElement('div');
+    card.className = 'cust-card';
+    card.innerHTML = `
+      <div class="cust-head">
+        <div>
+          <div class="cust-name">${cust.customer_name} <span class="tier-badge">${(cust.box_type||'').split('(')[0].trim()}</span></div>
+          <button class="history-link" onclick="openDrawer('${cust.customer_name.replace(/'/g,"\\'")}')" style="margin-top:8px;">🔎 View her history — without leaving this page</button>
+        </div>
+        <div style="text-align:right">
+          <div class="box-total">AED ${totalPrice.toFixed(2)}</div>
+          <div class="cust-meta">${approvedHere}/${cust.items.length} approved</div>
+        </div>
+      </div>
+      ${cust.items.map(it=>renderItemRow(it)).join('')}
+    `;
+    wrap.appendChild(card);
+  });
+
+  const totalCustomers = boardCustomers.length;
+  document.getElementById('progressLabel').textContent = `${approvedTotal} of ${totalCustomers} approved`;
+  document.getElementById('progressFill').style.width = totalCustomers ? (approvedTotal/totalCustomers*100)+'%' : '0%';
+  const commitBtn = document.getElementById('commitBtn');
+  if(totalCustomers && approvedTotal === totalCustomers){ commitBtn.classList.add('ready'); commitBtn.textContent = 'Commit Month →'; }
+  else { commitBtn.classList.remove('ready'); commitBtn.textContent = `Commit Month (${approvedTotal}/${totalCustomers} ready)`; }
+  renderHome();
+}
+
+function renderItemRow(it){
+  const isApproved = it.status === 'Approved';
+  const rk = rowKey(it.row_number);
+  return `
+    <div class="item-row ${isApproved?'approved':''}">
+      <div class="item-num">${it.idx}</div>
+      <div>
+        <div class="item-name">${it.name}${it.manual?'<span class="owner-picked-tag">✏️ Owner-picked</span>':''}</div>
+        <div class="item-sub">${it.category} · ${it.tier} · AED ${it.price} · stock ${it.stock}</div>
+        <div class="item-why">${it.why||''}</div>
+      </div>
+      <div class="item-actions">
+        ${isApproved
+          ? `<span class="approved-tag">✓ Approved</span><button class="btn btn-undo" onclick="unapprove(${it.row_number})">Undo</button>`
+          : `<button class="btn btn-swap" onclick="doSwap(${it.row_number})" title="Next alternative in the same category (${it.category})">↻ Swap</button>
+             <select class="cat-select" onchange="doSwapCategory(${it.row_number}, this.value)" title="Swap into a different category instead">
+               <option value="">↕ Other category…</option>
+             </select>
+             <button class="btn manual-toggle" onclick="toggleManual(${it.row_number})">✏️ Enter my own</button>
+             <button class="btn btn-approve" onclick="approve(${it.row_number})">✓ Approve</button>`
+        }
+      </div>
+      <div class="manual-panel" id="manual-${rk}">
+        <input placeholder="Type any product name — searches real, in-stock inventory only…" oninput="filterManual(${it.row_number}, this.value)">
+        <div class="manual-results" id="manualResults-${rk}"></div>
+        <div class="manual-warning" id="manualWarn-${rk}"></div>
+        <div class="manual-ok" id="manualOk-${rk}"></div>
+      </div>
+      <div class="cat-warning" id="catWarn-${rk}"></div>
+    </div>
+  `;
+}
+
+/* categories for the "Other category" dropdown, filled in once inventory is fetched */
+async function ensureInventory(){
+  if(inventoryCatalog) return inventoryCatalog;
+  const data = await api('/dashboard/inventory');
+  inventoryCatalog = (data && data.items) || [];
+  const cats = [...new Set(inventoryCatalog.map(p=>p.category))].sort();
+  document.querySelectorAll('.cat-select').forEach(sel=>{
+    cats.forEach(c=>{
+      const opt = document.createElement('option');
+      opt.value = c; opt.textContent = c;
+      sel.appendChild(opt);
+    });
+  });
+  return inventoryCatalog;
+}
+
+async function doSwap(rowNumber){
+  try{
+    const res = await postForm('/dashboard/swap', {row_number: rowNumber});
+    if(!res) return;
+    if(!res.found){ alert(res.message || 'No more alternatives available.'); return; }
+    await loadBoard();
+  }catch(e){ alert('Swap failed: ' + e.message); }
+}
+
+async function doSwapCategory(rowNumber, category){
+  if(!category) return;
+  try{
+    const res = await postForm('/dashboard/swap_category', {row_number: rowNumber, category});
+    if(!res) return;
+    if(!res.found){ alert(res.message || `No in-stock products in "${category}" right now.`); return; }
+    await loadBoard();
+    setTimeout(()=>{
+      const warnEl = document.getElementById('catWarn-'+rowKey(rowNumber));
+      if(warnEl){
+        warnEl.textContent = `⚠ This changes her category mix from the original plan (was ${res.old_category}, now ${res.new_category}). Box total above is already updated — just double-check it still fits her plan before approving.`;
+        warnEl.classList.add('show');
+      }
+    }, 30);
+  }catch(e){ alert('Category swap failed: ' + e.message); }
+}
+
+async function approve(rowNumber){
+  try{ await postForm('/dashboard/approve', {row_number: rowNumber}); await loadBoard(); }
+  catch(e){ alert('Approve failed: ' + e.message); }
+}
+async function unapprove(rowNumber){
+  try{ await postForm('/dashboard/unapprove', {row_number: rowNumber}); await loadBoard(); }
+  catch(e){ alert('Undo failed: ' + e.message); }
+}
+
+async function tryCommit(){
+  if(!document.getElementById('commitBtn').classList.contains('ready')) return;
+  if(!confirm(`Commit ${currentMonth} for all fully-approved customers? This decrements stock permanently and writes the final records.`)) return;
+  try{
+    const res = await postForm('/dashboard/commit_month', {target_month: currentMonth});
+    if(!res) return;
+    alert(`Committed: ${res.committed_customers.join(', ') || '(none)'}\n\nStill pending: ${res.still_pending_customers.join(', ') || '(none)'}`);
+    await loadBoard();
+  }catch(e){ alert('Commit failed: ' + e.message); }
+}
+
+/* ---------------- manual "enter my own" ---------------- */
+let openManualRowKey = null;
+
+async function toggleManual(rowNumber){
+  await ensureInventory();
+  const rk = rowKey(rowNumber);
+  const panel = document.getElementById('manual-'+rk);
+  const wasOpen = panel.classList.contains('open');
+  document.querySelectorAll('.manual-panel.open').forEach(p=>p.classList.remove('open'));
+  if(!wasOpen){ panel.classList.add('open'); panel.querySelector('input').focus(); openManualRowKey = rk; }
+  else { openManualRowKey = null; }
+}
+
+function getBrandGuess(name){
+  // lightweight client-side guess just for showing a friendly label in results;
+  // the real brand-duplicate check happens server-side in /dashboard/manual_pick
+  return name.split(' ')[0];
+}
+
+async function filterManual(rowNumber, val){
+  const rk = rowKey(rowNumber);
+  const resultsEl = document.getElementById('manualResults-'+rk);
+  document.getElementById('manualWarn-'+rk).classList.remove('show');
+  document.getElementById('manualOk-'+rk).classList.remove('show');
+  if(val.trim().length < 2){ resultsEl.innerHTML=''; return; }
+  const inv = await ensureInventory();
+  const q = val.toLowerCase();
+  const matches = inv.filter(p=>p.name.toLowerCase().includes(q)).slice(0,8);
+  resultsEl.innerHTML = matches.length
+    ? matches.map(p=>`
+        <div class="manual-result" onclick='selectManual(${rowNumber}, ${JSON.stringify(p.name)})'>
+          <span class="mr-name">${p.name}</span>
+          <span class="mr-meta">${p.category} · ${p.tier} · AED ${p.price} · stock ${p.stock}</span>
+        </div>`).join('')
+    : `<div class="mr-meta" style="padding:8px 10px;">No in-stock product matches "${val}".</div>`;
+}
+
+async function selectManual(rowNumber, productName){
+  const rk = rowKey(rowNumber);
+  openManualRowKey = rk;
+  try{
+    const res = await postForm('/dashboard/manual_pick', {row_number: rowNumber, product_name: productName});
+    if(!res) return;
+    if(res.error){ alert(res.error); return; }
+    await loadBoard();
+    setTimeout(()=>{
+      const panel = document.getElementById('manual-'+rk);
+      if(panel) panel.classList.add('open');
+      const resultsEl = document.getElementById('manualResults-'+rk);
+      const warnEl = document.getElementById('manualWarn-'+rk);
+      const okEl = document.getElementById('manualOk-'+rk);
+      const inputEl = document.querySelector(`#manual-${rk} input`);
+      if(inputEl) inputEl.value = '';
+      if(resultsEl){
+        resultsEl.innerHTML = `<div class="mr-meta" style="padding:8px 10px; font-weight:700; color:var(--purple-dark);">✓ Selected "${productName}" — the item above is now updated. <span style="text-decoration:underline;cursor:pointer;" onclick="document.querySelector('#manual-${rk} input').focus()">Search a different product</span></div>`;
+      }
+      let msgs = [];
+      if(res.blocked) msgs.push(`⚠️ You blocked ${res.brand} for this customer — double-check before sending.`);
+      if(res.brand_clash) msgs.push(`Heads up — she already has another ${res.brand} product elsewhere in this box.`);
+      if(res.repeat) msgs.push(`Heads up — she's received this exact product before.`);
+      if(msgs.length){ warnEl.textContent = '⚠ '+msgs.join(' '); warnEl.classList.add('show'); okEl.classList.remove('show'); }
+      else { okEl.textContent = '✓ Checked — no brand repeat in this box and no repeat in her history.'; okEl.classList.add('show'); warnEl.classList.remove('show'); }
+    }, 30);
+  }catch(e){ alert('Manual pick failed: ' + e.message); }
+}
+
+/* ---------------- slide-over drawer + customer search — both call the
+   same real /customer_lookup + /customer_search_product endpoints ---------------- */
+function openDrawer(name){
+  if(!name || !name.trim()) return;
+  document.getElementById('drawerBackdrop').classList.add('open');
+  document.getElementById('drawer').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  renderProfileInto('drawerBody', name);
+}
+function closeDrawer(){
+  document.getElementById('drawerBackdrop').classList.remove('open');
+  document.getElementById('drawer').classList.remove('open');
+  document.body.style.overflow = '';
+}
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeDrawer(); });
+
+function goSearch(name){
+  showPage('customers');
+  document.getElementById('custSearch').value = name;
+  renderProfileInto('profileArea', name);
+}
+async function filterSuggest(val){
+  const row = document.getElementById('suggestRow');
+  const all = await ensureAllCustomers();
+  const names = all.map(c=>c.name);
+  const matches = val ? names.filter(n=>n.toLowerCase().includes(val.toLowerCase())) : names;
+  row.innerHTML = matches.map(n=>`<span class="suggest-chip" onclick="goSearch('${n.replace(/'/g,"\\'")}')">${n}</span>`).join('')
+    || '<span class="suggest-chip" style="opacity:.5">no customer found with that name</span>';
+}
+
+function labelize(k){
+  return String(k).replace(/_/g,' ').replace(/\b\w/g, c=>c.toUpperCase());
+}
+
+async function renderProfileInto(targetId, name){
+  const area = document.getElementById(targetId);
+  area.innerHTML = `<div class="empty-note">Loading…</div>`;
+  const data = await api('/customer_lookup?name=' + encodeURIComponent(name));
+  if(!data || data.error){
+    area.innerHTML = `<div class="empty-note">${(data && data.error) || 'No customer found named "'+name+'".'}</div>`;
+    return;
+  }
+  const months = [...new Set(data.product_history.map(p=>p.month))].filter(Boolean).sort();
+  const byMonth = {};
+  data.product_history.forEach(p=>{ (byMonth[p.month] = byMonth[p.month]||[]).push(p.product); });
+
+  // Full frequency breakdown — every level she was ever asked about, not
+  // just "Often". Grouped by level so it reads the same way the quiz did.
+  const freqGroups = {};
+  Object.entries(data.frequencies||{}).forEach(([k,v])=>{
+    if(!v) return;
+    (freqGroups[v] = freqGroups[v] || []).push(labelize(k));
+  });
+  const freqOrder = ['Often','Sometimes','Rarely'];
+  const freqPillClass = { Often:'red', Sometimes:'amber', Rarely:'green' };
+  const extraFreqLevels = Object.keys(freqGroups).filter(l=>!freqOrder.includes(l));
+
+  let birthdayFlag = '';
+  if(data.birthday){
+    const bMonth = parseInt(String(data.birthday).slice(5,7), 10);
+    const bDay = parseInt(String(data.birthday).slice(8,10), 10);
+    const today = new Date();
+    if(bMonth === today.getMonth() + 1){
+      const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      birthdayFlag = `<div class="birthday-flag">🎂 Birthday is this month — ${monthNames[bMonth-1]} ${bDay}</div>`;
+    }
+  }
+
+  area.innerHTML = `
+    <div class="panel profile-card show">
+      <div class="profile-head">
+        <div>
+          <div class="profile-name">${data.customer_name} <span class="tier-badge">${data.box_type||''}</span></div>
+          <div class="profile-meta">customer since ${data.subscribed_since||'—'} · ${data.product_history.length} products on record</div>
+          ${birthdayFlag}
+        </div>
+      </div>
+
+      <div class="row-line" style="margin-top:2px;">
+        <span>Subscription status</span>
+        <span class="pill ${String(data.status||'').toLowerCase()==='active' ? 'green' : 'red'}">${data.status ? labelize(data.status) : 'Unknown'}</span>
+      </div>
+      <div style="margin:6px 0 16px;">
+        ${ String(data.status||'').toLowerCase()==='active'
+            ? `<button class="btn btn-danger-outline" onclick="setCustomerStatus('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}','Cancelled')">Mark customer as cancelled</button>`
+            : `<button class="btn btn-outline" onclick="setCustomerStatus('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}','Active')">Reactivate customer</button>`
+        }
+        <div style="font-size:11.5px;color:var(--muted);margin-top:5px;">Cancelling stops future months from generating a box for her. It doesn't touch a box already committed — cancel that individually below if it hasn't gone out.</div>
+      </div>
+
+      ${data.boxes && data.boxes.length ? `
+      <h3 style="margin-top:4px;">Her boxes</h3>
+      ${data.boxes.map(b => `
+        <div class="row-line" id="boxrow-${b.box_id}">
+          <span>${b.month || '—'} <span style="opacity:.55;font-size:11px;">${b.box_id}</span></span>
+          <span style="display:flex;align-items:center;gap:8px;">
+            <span class="pill ${String(b.status).toLowerCase()==='cancelled' ? 'red' : 'green'}">${b.status}</span>
+            ${String(b.status).toLowerCase()!=='cancelled' ? `<button class="btn btn-danger-outline" onclick="cancelBox('${b.box_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Cancel &amp; restock</button>` : ''}
+          </span>
+        </div>
+      `).join('')}
+      ` : ''}
+
+      <h3 style="margin-top:18px;">Blocked brands</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">A blocked brand is never suggested for her again, in any category — for a full "no [brand] products" request. For one specific product only, reject it during a normal swap instead.</div>
+      ${data.blocked_brands && data.blocked_brands.length ? data.blocked_brands.map(b => `
+        <div class="row-line">
+          <span>${labelize(b.brand)}${b.reason ? ` <span style="color:var(--muted);font-weight:400;">— ${b.reason}</span>` : ''}</span>
+          <button class="btn btn-undo" onclick="unblockBrand('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}','${b.brand.replace(/'/g,"\\'")}')">Unblock</button>
+        </div>
+      `).join('') : '<div class="empty-note" style="padding:8px 0;">No brands blocked for her.</div>'}
+      <div class="check-row" style="margin-top:8px;">
+        <input id="blockBrandInput-${targetId}" placeholder="Brand to block, e.g. Elf">
+        <button onclick="blockBrand('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Block brand</button>
+      </div>
+
+      ${data.shade_notes && data.shade_notes.length ? `
+      <h3 style="margin-top:18px;">Exact shades on file</h3>
+      ${data.shade_notes.map(s => `
+        <div class="row-line" style="align-items:flex-start;">
+          <span>${s.category}</span>
+          <span style="text-align:right;">
+            <span class="pill green">${s.confirmed}</span>
+            ${s.avoid && s.avoid !== '—' ? `<br><span class="pill red" style="margin-top:4px;display:inline-block;">avoid: ${s.avoid}</span>` : ''}
+          </span>
+        </div>
+        ${s.details ? `<div style="font-size:11.5px;color:var(--muted);margin:-4px 0 8px;">${s.details}</div>` : ''}
+      `).join('')}
+      ` : ''}
+
+      <h3 style="margin-top:18px;">Owner notes</h3>
+      <textarea id="notesArea-${targetId}" rows="3" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;">${data.notes || ''}</textarea>
+      <div style="margin-top:6px;"><button class="btn btn-swap" onclick="saveNotes('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save notes</button></div>
+
+      ${Object.keys(freqGroups).length ? `
+      <h3 style="margin-top:18px;">How often she wants each category</h3>
+      ${freqOrder.concat(extraFreqLevels).map(level => freqGroups[level] && freqGroups[level].length ? `
+        <div class="row-line"><span>${level}</span><span class="pill ${freqPillClass[level] || 'amber'}">${freqGroups[level].join(', ')}</span></div>
+      ` : '').join('')}
+      ` : ''}
+
+      ${data.preferences && Object.keys(data.preferences).length ? `
+      <h3 style="margin-top:18px;">Style &amp; shopping preferences</h3>
+      ${Object.entries(data.preferences).map(([k,v]) => `
+        <div class="row-line"><span>${labelize(k)}</span><span class="pill amber">${(Array.isArray(v)?v:[v]).filter(Boolean).join(', ') || '—'}</span></div>
+      `).join('')}
+      ` : ''}
+
+      ${data.quiz && Object.keys(data.quiz).length ? `
+      <h3 style="margin-top:18px;">Quiz answers</h3>
+      ${Object.entries(data.quiz).map(([k,v]) => `
+        <div class="row-line"><span>${labelize(k)}</span><span class="pill green">${v || '—'}</span></div>
+      `).join('')}
+      ` : ''}
+
+      <div class="check-box">
+        <label>💬 "Has she received this before?"</label>
+        <div class="check-row">
+          <input id="checkInput-${targetId}" placeholder="Type a product name…">
+          <button onclick="checkProduct('${targetId}', '${data.customer_name.replace(/'/g,"\\'")}')">Check</button>
+        </div>
+        <div class="check-result" id="checkResult-${targetId}"></div>
+      </div>
+
+      <h3 style="margin-top:22px;">Full product history — ${months.length} month${months.length===1?'':'s'}</h3>
+      ${months.slice().reverse().map(m=>`
+        <div class="history-month">
+          <div class="history-month-label">${m}</div>
+          <div class="history-items">
+            ${byMonth[m].map(p=>`<span class="history-item">${p}</span>`).join('')}
+          </div>
+        </div>
+      `).join('') || '<div class="empty-note">No history on record yet.</div>'}
+    </div>
+  `;
+}
+
+async function setCustomerStatus(customerId, targetId, customerName, newStatus){
+  if(newStatus === 'Cancelled'){
+    if(!confirm(`Mark ${customerName} as cancelled? She won't get a box generated in any future month until you reactivate her. This does not cancel any box already committed.`)) return;
+  }
+  try{
+    const data = await postForm('/dashboard/set_customer_status', { customer_id: customerId, status: newStatus });
+    if(!data || data.error){ alert('Could not update status: ' + ((data && data.error) || 'unknown error')); return; }
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not update status: ' + e.message); }
+}
+
+async function cancelBox(boxId, targetId, customerName){
+  if(!confirm(`Cancel box ${boxId} for ${customerName} and restock its items? Only do this if the box did NOT actually go out.`)) return;
+  try{
+    const data = await postForm('/dashboard/cancel_box', { box_id: boxId });
+    if(!data || data.error){ alert('Could not cancel box: ' + ((data && data.error) || 'unknown error')); return; }
+    if(data.already_cancelled){ alert('That box was already cancelled.'); }
+    else{ alert(`Cancelled ${boxId} — restocked ${data.restocked_count} item(s).`); }
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not cancel box: ' + e.message); }
+}
+
+async function blockBrand(customerId, targetId, customerName){
+  const inputEl = document.getElementById('blockBrandInput-'+targetId);
+  const brand = inputEl ? inputEl.value.trim() : '';
+  if(!brand){ alert('Type a brand name first.'); return; }
+  try{
+    const data = await postForm('/dashboard/block_brand', { customer_id: customerId, customer_name: customerName, brand });
+    if(!data || data.error){ alert('Could not block brand: ' + ((data && data.error) || 'unknown error')); return; }
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not block brand: ' + e.message); }
+}
+
+async function unblockBrand(customerId, targetId, customerName, brand){
+  if(!confirm(`Unblock ${brand} for ${customerName}? She'll be eligible for ${brand} products again.`)) return;
+  try{
+    const data = await postForm('/dashboard/unblock_brand', { customer_id: customerId, brand });
+    if(!data || data.error){ alert('Could not unblock brand: ' + ((data && data.error) || 'unknown error')); return; }
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not unblock brand: ' + e.message); }
+}
+
+async function saveNotes(customerId, targetId, customerName){
+  const area = document.getElementById('notesArea-'+targetId);
+  const notes = area ? area.value : '';
+  try{
+    const data = await postForm('/dashboard/set_customer_notes', { customer_id: customerId, notes });
+    if(!data || data.error){ alert('Could not save notes: ' + ((data && data.error) || 'unknown error')); return; }
+    alert('Notes saved.');
+  }catch(e){ alert('Could not save notes: ' + e.message); }
+}
+
+async function checkProduct(targetId, customerName){
+  const inputEl = document.getElementById('checkInput-'+targetId);
+  const resultEl = document.getElementById('checkResult-'+targetId);
+  if(!inputEl || !resultEl) return;
+  const val = inputEl.value.trim();
+  if(!val) return;
+  const data = await api(`/customer_search_product?name=${encodeURIComponent(customerName)}&product=${encodeURIComponent(val)}`);
+  resultEl.classList.add('show');
+  if(data && data.has_received){
+    resultEl.className = 'check-result show yes';
+    resultEl.textContent = `Yes — she received "${data.matches[0].product}" in ${data.matches[0].month}.`;
+  } else {
+    resultEl.className = 'check-result show no';
+    resultEl.textContent = `No record of that — safe to recommend.`;
+  }
+}
+
+/* ---------------- init ---------------- */
+loadBoard();
+</script>
+
+</body>
+</html>
