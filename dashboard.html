@@ -259,6 +259,8 @@
 
 <main>
 
+  <div id="backupWarning" style="display:none; background:#fdecea; border:1.5px solid #e0776d; color:#8a2f24; padding:12px 16px; border-radius:8px; margin-bottom:18px; font-size:13.5px; line-height:1.5;"></div>
+
   <!-- ============ HOME ============ -->
   <div class="page active" id="page-home">
     <h1 class="page-title">Good morning, Iqra 👋</h1>
@@ -461,6 +463,25 @@ async function loadBoard(){
   }
   renderReview();
   renderHome();
+  checkBackupStatus(); // fire-and-forget — don't hold up the board on this
+}
+
+/* ---------------- GitHub backup health ---------------- */
+async function checkBackupStatus(){
+  let data;
+  try{ data = await api('/dashboard/backup_status'); }catch(e){ return; }
+  const el = document.getElementById('backupWarning');
+  if(!el) return;
+  if(data && data.last_error){
+    const lastGood = data.last_success ? new Date(data.last_success).toLocaleString() : 'never yet this session';
+    const n = data.consecutive_failures || 1;
+    el.style.display = 'block';
+    el.innerHTML = `⚠️ <b>The backup copy on GitHub is currently failing</b> (${n} attempt${n===1?'':'s'} in a row). `
+      + `Everything you do is still saved safely right here on the server, but until this is fixed, your most recent changes wouldn't survive a server restart. `
+      + `Last successful backup: ${lastGood}. Details: ${data.last_error}`;
+  } else {
+    el.style.display = 'none';
+  }
 }
 
 function renderHome(){
@@ -872,6 +893,16 @@ async function loadManualCatalog(rowNumber){
   }catch(e){ infoEl.textContent = 'Could not load her product list: ' + e.message; }
 }
 
+function jsAttrEscape(s){
+  // Makes a string safe to drop into `onclick="fn('...')"` — backslashes and
+  // single quotes escaped for the JS string literal, double quotes escaped
+  // for the surrounding HTML attribute. Needed because product names can
+  // contain apostrophes (e.g. "L'Oréal…", "Fenty Beauty We're Even…") which
+  // would otherwise terminate the attribute early and silently mangle the
+  // click handler.
+  return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+}
+
 function renderManualList(rowNumber, filterText){
   const rk = rowKey(rowNumber);
   const resultsEl = document.getElementById('manualResults-'+rk);
@@ -891,7 +922,7 @@ function renderManualList(rowNumber, filterText){
       : (p.blocked
           ? `<span class="mr-blocked-tag">⚠ she doesn't want this — ${p.brand}</span>`
           : `<span class="mr-meta">${p.tier} · AED ${p.price} · stock ${p.stock}</span>`);
-    html += `<div class="manual-result ${cls}" onclick='selectManual(${rowNumber}, ${JSON.stringify(p.name)})'>
+    html += `<div class="manual-result ${cls}" onclick="selectManual(${rowNumber}, '${jsAttrEscape(p.name)}')">
         <span class="mr-name">${p.name}</span>${tag}
       </div>`;
   });

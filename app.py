@@ -35,50 +35,139 @@ from functools import wraps
 import requests
 import base64 as base64_lib
 import threading
+import time
+
+# Tracks the on-disk modified-time of the bundled workbook as of the last
+# real reload, so we only pay the cost of re-parsing the whole spreadsheet
+# when the file has actually changed -- not on every single request. A full
+# reload re-executes recommend_v5.py from scratch (re-finds the workbook and
+# re-parses every sheet with openpyxl), which takes several real seconds on
+# a workbook this size -- doing that on every click (including things that
+# only read data, like viewing a customer profile or checking inventory)
+# was the main reason the dashboard felt slow. Since this app runs as a
+# single worker process (see Procfile), the in-memory recommend_v5.wb
+# object already reflects every write THIS process has made -- a fresh
+# reload is only actually needed the first time, or if the file changed
+# for a reason outside our own save calls (a fresh deploy, most commonly).
+_workbook_state = {'mtime': None}
+
+def _reload_if_needed():
+    try:
+        current_mtime = os.path.getmtime(recommend_v5.path) if recommend_v5.path else None
+    except (OSError, TypeError):
+        current_mtime = None
+
+    if _workbook_state['mtime'] is None or current_mtime != _workbook_state['mtime']:
+        importlib.reload(recommend_v5)
+        try:
+            _workbook_state['mtime'] = os.path.getmtime(recommend_v5.path) if recommend_v5.path else None
+        except (OSError, TypeError):
+            _workbook_state['mtime'] = current_mtime
+    return recommend_v5
+
+def _force_reload_real_workbook():
+    """Unconditionally re-reads recommend_v5 from the real bundled workbook
+    path, discarding any in-memory state left over from a temporary/uploaded
+    file. /recommend and /generate_month_formatted both point recommend_v5.wb
+    at a temp uploaded file via set_workbook_path() -- which only reassigns
+    the in-memory `wb` object and never touches `recommend_v5.path` itself.
+    Before _reload_if_needed() existed, every request unconditionally
+    re-ran the whole module top-to-bottom, which reset `wb` back to the real
+    file as a side effect -- so this was harmless by accident. Now that
+    reloads only happen when recommend_v5.path's file has actually changed
+    on disk, that accidental reset no longer happens: since `path` itself
+    was never touched, _reload_if_needed() sees "nothing changed" and skips
+    the reload, leaving `wb` pointed at the now-deleted temp file for every
+    request afterward -- including real dashboard actions, whose very next
+    save would silently overwrite the live production workbook with that
+    incomplete snapshot. Both of those endpoints call this in a `finally`
+    block so the shared state is always put back, whether they succeed or not."""
+    importlib.reload(recommend_v5)
+    try:
+        _workbook_state['mtime'] = os.path.getmtime(recommend_v5.path) if recommend_v5.path else None
+    except (OSError, TypeError):
+        _workbook_state['mtime'] = None
 
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 GITHUB_REPO = 'anisanaeem2994-bot/snatched-recommend-engine'
 GITHUB_FILE_PATH = 'snatched_beauty_box_master.xlsx'
 
-def push_to_github():
+# Tracks the health of the GitHub backup so the dashboard can show a clear
+# warning banner instead of a backup silently failing with nobody knowing.
+# 'last_success'/'last_attempt' are ISO timestamp strings (or None if this
+# process has never tried yet). Read by /dashboard/backup_status.
+_backup_state = {
+    'last_success': None,
+    'last_attempt': None,
+    'last_error': None,
+    'consecutive_failures': 0,
+}
+
+def push_to_github(retries=3, backoff_seconds=2):
     """Called automatically after any real change (approve, unapprove,
     finalize) — immediately saves the current state to GitHub, so it
     survives even if Render restarts a moment later. Uses Python's own
     reliable requests + base64 libraries directly, not Make.com's fragile
-    binary handling (which corrupted a file earlier today)."""
+    binary handling (which corrupted a file earlier today).
+
+    Retries up to `retries` times with a short backoff before giving up —
+    a single dropped connection or a momentary GitHub hiccup used to mean
+    that one change silently never got backed up, with nothing on screen
+    telling anyone it happened. Every attempt (success or final failure)
+    updates _backup_state so /dashboard/backup_status can report real,
+    current backup health."""
     if not GITHUB_TOKEN:
-        print('WARNING: GITHUB_TOKEN not set — changes will NOT survive a restart.', flush=True)
+        msg = 'GITHUB_TOKEN not set — changes will NOT survive a restart.'
+        print(f'WARNING: {msg}', flush=True)
+        _backup_state['last_attempt'] = _datetime.now().isoformat()
+        _backup_state['last_error'] = msg
+        _backup_state['consecutive_failures'] += 1
         return False
-    try:
-        headers = {'Authorization': f'token {GITHUB_TOKEN}'}
-        get_url = f'https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}'
-        current = requests.get(get_url, headers=headers, timeout=15)
-        sha = current.json().get('sha') if current.status_code == 200 else None
 
-        with open(recommend_v5.path, 'rb') as f:
-            content_b64 = base64_lib.b64encode(f.read()).decode('utf-8')
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            headers = {'Authorization': f'token {GITHUB_TOKEN}'}
+            get_url = f'https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}'
+            current = requests.get(get_url, headers=headers, timeout=15)
+            sha = current.json().get('sha') if current.status_code == 200 else None
 
-        payload = {'message': 'Auto-save after approval/change', 'content': content_b64}
-        if sha:
-            payload['sha'] = sha
+            with open(recommend_v5.path, 'rb') as f:
+                content_b64 = base64_lib.b64encode(f.read()).decode('utf-8')
 
-        resp = requests.put(get_url, headers=headers, json=payload, timeout=30)
-        if resp.status_code in (200, 201):
-            print('Successfully pushed changes to GitHub.', flush=True)
-            return True
-        else:
-            print(f'GitHub push failed: {resp.status_code} {resp.text[:200]}', flush=True)
-            return False
-    except Exception as e:
-        print(f'GitHub push error: {e}', flush=True)
-        return False
+            payload = {'message': 'Auto-save after approval/change', 'content': content_b64}
+            if sha:
+                payload['sha'] = sha
+
+            resp = requests.put(get_url, headers=headers, json=payload, timeout=30)
+            if resp.status_code in (200, 201):
+                print('Successfully pushed changes to GitHub.', flush=True)
+                now = _datetime.now().isoformat()
+                _backup_state['last_success'] = now
+                _backup_state['last_attempt'] = now
+                _backup_state['last_error'] = None
+                _backup_state['consecutive_failures'] = 0
+                return True
+            else:
+                last_error = f'GitHub responded {resp.status_code}: {resp.text[:200]}'
+                print(f'GitHub push failed (attempt {attempt}/{retries}): {last_error}', flush=True)
+        except Exception as e:
+            last_error = str(e)
+            print(f'GitHub push error (attempt {attempt}/{retries}): {e}', flush=True)
+
+        if attempt < retries:
+            time.sleep(backoff_seconds * attempt)  # 2s, then 4s
+
+    _backup_state['last_attempt'] = _datetime.now().isoformat()
+    _backup_state['last_error'] = last_error
+    _backup_state['consecutive_failures'] += 1
+    return False
 
 def push_to_github_async():
     """Fire-and-forget wrapper around push_to_github(). The real function
-    makes two real network calls to GitHub's API (a GET then a PUT), each
-    with its own timeout (15s + 30s) -- if GitHub is slow, or the token
-    is bad and every retry/redirect eats time, that's up to ~45+ seconds
-    the dashboard would otherwise sit there waiting on before the person
+    makes real network calls to GitHub's API (a GET then a PUT per attempt,
+    up to 3 attempts) -- if GitHub is slow, or the token is bad, that's real
+    time the dashboard would otherwise sit there waiting on before the person
     using it sees ANYTHING happen, even though their change already saved
     successfully to local disk moments earlier. Every write endpoint below
     already calls wb.save(recommend_v5.path) synchronously first -- the
@@ -205,9 +294,21 @@ def customer_lookup_endpoint():
         return jsonify({'error': 'name is required, e.g. ?name=Sandra Hoffmann'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         customers = recommend_v5.load_customers()
-        cust = next((c for c in customers.values() if c['name'].lower() == customer_name.lower()), None)
+        search = customer_name.strip().lower()
+        # Exact match first (handles the normal "click a suggestion chip" flow,
+        # which always sends the full stored name). If that misses, fall back
+        # to a partial/substring match so typing just "bushra" and hitting
+        # Enter still finds "Bushra Al Sabri" instead of 404ing.
+        cust = next((c for c in customers.values() if c['name'].lower() == search), None)
+        if not cust:
+            partial_matches = [c for c in customers.values() if search in c['name'].lower()]
+            if len(partial_matches) == 1:
+                cust = partial_matches[0]
+            elif len(partial_matches) > 1:
+                names = ', '.join(sorted(m['name'] for m in partial_matches))
+                return jsonify({'error': f'More than one customer matches "{customer_name}" — did you mean: {names}?'}), 404
         if not cust:
             return jsonify({'error': f'No customer found named "{customer_name}".'}), 404
         cid = cust['id']
@@ -295,7 +396,7 @@ def customer_search_product_endpoint():
         return jsonify({'error': 'both name and product are required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         customers = recommend_v5.load_customers()
         cust = next((c for c in customers.values() if c['name'].lower() == customer_name.lower()), None)
         if not cust:
@@ -330,7 +431,7 @@ def dashboard_set_customer_status():
         return jsonify({'error': 'customer_id and status (Active or Cancelled) are required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws_c = wb['customers']
         id_col = 1
@@ -365,7 +466,7 @@ def dashboard_cancel_box():
         return jsonify({'error': 'box_id is required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws_b = wb['boxes']
         ws_i = wb['box_items']
@@ -448,7 +549,7 @@ def dashboard_block_brand():
         return jsonify({'error': 'customer_id and brand are required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_blocked_brands_sheet(create=True)
         brand_lower = brand.lower()
         # Don't add a duplicate row if this brand's already blocked for her.
@@ -456,7 +557,12 @@ def dashboard_block_brand():
             if row[0] == customer_id and str(row[1] or '').strip().lower() == brand_lower:
                 return jsonify({'success': True, 'already_blocked': True})
 
-        target_month = recommend_v5.TARGET_MONTH or ''
+        # Informational only (not read by anything enforcing eligibility) --
+        # deliberately NOT reading recommend_v5.TARGET_MONTH here, since that's
+        # a shared global other requests set and clear for their own reasons;
+        # relying on it could silently record the wrong month depending on
+        # what some unrelated earlier request last set it to.
+        target_month = _datetime.now().strftime('%Y-%m')
         ws.append([customer_id, brand, reason, target_month, customer_name])
         recommend_v5.wb.save(recommend_v5.path)
         push_to_github_async()
@@ -475,7 +581,7 @@ def dashboard_unblock_brand():
         return jsonify({'error': 'customer_id and brand are required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_blocked_brands_sheet(create=False)
         if ws is None:
             return jsonify({'success': True, 'removed': 0})
@@ -507,7 +613,7 @@ def dashboard_set_customer_notes():
         return jsonify({'error': 'customer_id is required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws_c = wb['customers']
         notes_col = 15  # customers sheet: ... upgrade_date, notes
@@ -552,7 +658,7 @@ def dashboard_edit_customer():
         return jsonify({'error': 'customer_id is required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws_c = wb['customers']
         target_row = None
@@ -597,7 +703,7 @@ def dashboard_edit_preferences():
         return jsonify({'error': 'customer_id is required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         updated = {}
 
@@ -677,6 +783,7 @@ def dashboard_edit_preferences():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/recommend', methods=['POST'])
+@dashboard_login_required
 def recommend_endpoint():
     if 'file' not in request.files:
         return jsonify({'error': 'No spreadsheet file was sent.'}), 400
@@ -693,7 +800,7 @@ def recommend_endpoint():
         tmp_path = tmp.name
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         recommend_v5.set_workbook_path(tmp_path)
         recommend_v5.set_target_month(target_month)
 
@@ -724,8 +831,10 @@ def recommend_endpoint():
         return jsonify({'error': str(e)}), 500
     finally:
         os.unlink(tmp_path)
+        _force_reload_real_workbook()
 
 @app.route('/approve_item', methods=['POST'])
+@dashboard_login_required
 def approve_item_endpoint():
     """Called the moment a row gets marked 'approved'. Immediately
     decrements that product's stock in the bundled file (and saves it to
@@ -740,7 +849,7 @@ def approve_item_endpoint():
     sheet_name = request.form.get('sheet_name', 'pending_approval')
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = recommend_v5.wb[sheet_name]
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
         name_col = headers.index('Product Name') + 1
@@ -771,6 +880,7 @@ def approve_item_endpoint():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/unapprove_item', methods=['POST'])
+@dashboard_login_required
 def unapprove_item_endpoint():
     """Reverses /approve_item — used if the owner changes her mind after
     approving something. Increments that product's stock back by 1."""
@@ -781,7 +891,7 @@ def unapprove_item_endpoint():
     sheet_name = request.form.get('sheet_name', 'pending_approval')
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = recommend_v5.wb[sheet_name]
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
         name_col = headers.index('Product Name') + 1
@@ -813,6 +923,7 @@ def unapprove_item_endpoint():
 
 
 @app.route('/swap', methods=['POST'])
+@dashboard_login_required
 def swap_endpoint():
     """Simplified — Make.com only needs to tell us WHICH ROW changed in
     pending_approval. We figure out the customer/category/tier ourselves
@@ -830,7 +941,7 @@ def swap_endpoint():
     print(f'DEBUG /swap received: row_number={row_number}, sheet_name={sheet_name!r}, target_month={target_month!r}', flush=True)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         recommend_v5.set_target_month(target_month)
 
         ws = recommend_v5.wb[sheet_name]
@@ -903,6 +1014,7 @@ def swap_endpoint():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/generate_month', methods=['POST'])
+@dashboard_login_required
 def generate_month_endpoint():
     """Generates a full month's recommendations for EVERY active/due customer
     in ONE call — not one customer at a time. This matters: it shares stock
@@ -916,7 +1028,7 @@ def generate_month_endpoint():
         return jsonify({'error': 'target_month is required, e.g. 2026-09'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         recommend_v5.set_target_month(target_month)
         recommend_v5.reset_allocations()
 
@@ -951,6 +1063,7 @@ def generate_month_endpoint():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/generate_month_rows', methods=['POST'])
+@dashboard_login_required
 def generate_month_rows_endpoint():
     """Returns a pre-flattened, ready-to-write list of rows — one header
     row per customer, immediately followed by their 5 product rows —
@@ -962,7 +1075,7 @@ def generate_month_rows_endpoint():
         return jsonify({'error': 'target_month is required, e.g. 2026-10'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         recommend_v5.set_target_month(target_month)
         recommend_v5.reset_allocations()
 
@@ -1026,46 +1139,8 @@ def generate_month_rows_endpoint():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-    target_month = request.form.get('target_month')
-    if not target_month:
-        return jsonify({'error': 'target_month is required, e.g. 2026-09'}), 400
-
-    try:
-        importlib.reload(recommend_v5)
-        recommend_v5.set_target_month(target_month)
-        recommend_v5.reset_allocations()
-
-        customers = recommend_v5.load_customers()
-        all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
-
-        results = []
-        for cid, cust in customers.items():
-            due, reason = recommend_v5.is_customer_due(cust, box_timeline, target_month)
-            if not due:
-                continue
-            out = recommend_v5.recommend(cust['name'])
-            if isinstance(out, str):
-                continue
-            (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
-             hist_pat, total, timeline, inv_cat_map, value_summary) = out
-            results.append({
-                'customer_name': c['name'],
-                'customer_id': c['id'],
-                'box_type': c['box_type'],
-                'products': [
-                    {'name': p['name'], 'category': p['category'], 'tier': p['tier'],
-                     'stock': p['stock'], 'price_aed': p.get('retail_price_aed')}
-                    for p in picks
-                ],
-                'value_summary': value_summary,
-                'warnings': warnings,
-            })
-
-        return jsonify({'target_month': target_month, 'customers': results})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/generate_month_formatted', methods=['POST'])
+@dashboard_login_required
 def generate_month_formatted_endpoint():
     """Does the whole job in one call: generates recommendations for every
     due customer AND writes them into a properly formatted sheet (pink
@@ -1089,7 +1164,7 @@ def generate_month_formatted_endpoint():
 
     try:
         import build_final_sheet
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         importlib.reload(build_final_sheet)
         recommend_v5.set_workbook_path(tmp_path)
         recommend_v5.set_target_month(target_month)
@@ -1102,9 +1177,12 @@ def generate_month_formatted_endpoint():
                           download_name='snatched_beauty_box_master_updated.xlsx')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        _force_reload_real_workbook()
 
 
 @app.route('/finalize_item', methods=['POST'])
+@dashboard_login_required
 def finalize_item_endpoint():
     """Called once per approved row, using data Make.com already has from
     a simple Search Rows step — no file export needed at all, avoiding
@@ -1123,7 +1201,7 @@ def finalize_item_endpoint():
         return jsonify({'error': 'customer_name, customer_id, product_name, target_month, and box_id are all required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws_items = recommend_v5.wb['box_items']
         next_item_num = ws_items.max_row
         next_item_num += 1
@@ -1136,6 +1214,7 @@ def finalize_item_endpoint():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/create_box_record', methods=['POST'])
+@dashboard_login_required
 def create_box_record_endpoint():
     """Called once per customer (not per item) to create the parent 'box'
     record. Returns a real box_id for Make.com to reuse across that
@@ -1149,7 +1228,7 @@ def create_box_record_endpoint():
         return jsonify({'error': 'customer_name, customer_id, and target_month are all required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws_boxes = recommend_v5.wb['boxes']
         next_box_num = ws_boxes.max_row + 1
         box_id = f'BOX{next_box_num:04d}'
@@ -1268,7 +1347,7 @@ def dashboard_generate_month():
         return jsonify({'error': 'target_month is required, e.g. 2026-11'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
 
         existing = _get_dash_sheet(create=False)
@@ -1403,7 +1482,7 @@ def dashboard_generate_for_customer():
         return jsonify({'error': 'customer_id and target_month are required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
 
         customers = recommend_v5.load_customers()
@@ -1473,12 +1552,23 @@ def dashboard_state():
     status — for the review page to render. Called on page load and after
     the drawer/manual-entry flows need a fresh read."""
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         blocks = _parse_dash_sheet(ws)
         return jsonify({'customers': blocks})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/backup_status', methods=['GET'])
+@dashboard_login_required
+def dashboard_backup_status():
+    """Reports whether the GitHub backup is actually working, so the
+    dashboard can show a clear warning instead of a failed backup happening
+    silently. Every change already saves to local disk first (that part
+    never depends on GitHub) — this is specifically about the second,
+    off-server copy that's needed for changes to survive a Render restart
+    or redeploy."""
+    return jsonify(_backup_state)
 
 LOW_STOCK_THRESHOLD = 3  # a category with this many or fewer total units left,
                           # across every product in it, is flagged "critically low"
@@ -1494,7 +1584,7 @@ def dashboard_home_stats():
     target_month = request.args.get('target_month')  # 'YYYY-MM', optional
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         customers = recommend_v5.load_customers()
 
         birthdays = []
@@ -1543,7 +1633,7 @@ def dashboard_months():
     powers the 'Past months' browser so Iqra can look back at any
     month's full history without hunting it one customer at a time."""
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws_b = recommend_v5.wb['boxes']
         months = sorted({str(row[3]) for row in ws_b.iter_rows(min_row=2, values_only=True) if row[3]}, reverse=True)
         return jsonify({'months': months})
@@ -1562,7 +1652,7 @@ def dashboard_month_detail():
     if not month:
         return jsonify({'error': 'month is required, e.g. ?month=2026-09'}), 400
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws_b = wb['boxes']
         ws_i = wb['box_items']
@@ -1602,7 +1692,7 @@ def dashboard_all_customers():
     Iqra can find and cancel anyone any day, not just customers who
     happen to be on the most recently generated month's board."""
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         customers = recommend_v5.load_customers()
         out = sorted(
             [{'id': c['id'], 'name': c['name'], 'status': c.get('status')} for c in customers.values()],
@@ -1623,7 +1713,7 @@ def dashboard_inventory():
       the 'Current inventory' browse/check panel uses, so Iqra can see
       out-of-stock items too and confirm counts after a restock."""
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         inv = recommend_v5.load_inventory()
         show_all = request.args.get('all') == '1'
         items = [
@@ -1714,7 +1804,7 @@ def dashboard_add_inventory():
         return jsonify({'error': 'quantity must be greater than 0.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws = wb['inventory']
         result = _apply_inventory_change(wb, ws, name, qty, category, tier, price_raw)
@@ -1738,7 +1828,7 @@ def dashboard_bulk_add_inventory():
     raw_lines = [ln.strip() for ln in raw.splitlines()]
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws = wb['inventory']
 
@@ -1845,7 +1935,7 @@ def dashboard_swap():
     row_number = int(row_number)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         block, item = _find_item_row_context(ws, row_number)
         if not item:
@@ -1891,7 +1981,7 @@ def dashboard_swap_category():
     row_number = int(row_number)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         block, item = _find_item_row_context(ws, row_number)
         if not item:
@@ -1940,7 +2030,7 @@ def dashboard_eligible_products():
     row_number = int(row_number)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         block, item = _find_item_row_context(ws, row_number)
         if not item:
@@ -1997,7 +2087,7 @@ def dashboard_manual_pick():
     row_number = int(row_number)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         block, item = _find_item_row_context(ws, row_number)
         if not item:
@@ -2022,7 +2112,17 @@ def dashboard_manual_pick():
         repeat = bool(cust) and product['name'].lower() in all_rec.get(cust['id'], set())
         blocked = bool(cust) and new_brand in recommend_v5.load_blocked_brands().get(cust['id'], set())
 
-        if item['status'] == 'Approved' and item['name'] != product['name']:
+        # Restock unconditionally whenever this slot was Approved -- even if
+        # the manually-picked product happens to be the SAME one already
+        # sitting here. _write_item_row() below always resets Status back to
+        # Pending (any manual change re-opens a slot for review), which means
+        # the one unit /dashboard/approve already took out of inventory needs
+        # to come back regardless of whether the name changed, or a later
+        # re-approve would decrement stock a second time for a box that only
+        # ever contained one physical unit. Matches the same unconditional
+        # restock-on-Approved pattern already used by /dashboard/swap and
+        # /dashboard/swap_category.
+        if item['status'] == 'Approved':
             _restock_product_by_name(recommend_v5.wb, item['name'])
 
         _write_item_row(ws, row_number, product,
@@ -2048,7 +2148,7 @@ def dashboard_approve():
     row_number = int(row_number)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         block, item = _find_item_row_context(ws, row_number)
         if not item:
@@ -2101,7 +2201,7 @@ def dashboard_unapprove():
     row_number = int(row_number)
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         ws = _get_dash_sheet(create=False)
         block, item = _find_item_row_context(ws, row_number)
         if not item:
@@ -2137,7 +2237,7 @@ def dashboard_download_workbook():
     the server after she downloads it; to see anything fresher she just
     downloads again."""
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         from flask import send_file
         return send_file(
             recommend_v5.path, as_attachment=True,
@@ -2159,7 +2259,7 @@ def dashboard_commit_month():
         return jsonify({'error': 'target_month is required.'}), 400
 
     try:
-        importlib.reload(recommend_v5)
+        _reload_if_needed()
         wb = recommend_v5.wb
         ws = _get_dash_sheet(create=False)
         blocks = _parse_dash_sheet(ws)
@@ -2206,98 +2306,6 @@ def dashboard_commit_month():
             'committed_customers': committed,
             'still_pending_customers': skipped,
         })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-def commit_month_endpoint():
-    """Called when the owner clicks 'Approve & Lock In' for a month.
-    Reads the CURRENT state of the spreadsheet directly — whatever she's
-    already approved/swapped in the pending_approval sheet for that month —
-    and commits exactly those products. Make.com's job is simple: export
-    the current sheet, send it here, upload back whatever comes back.
-    No complex data-building required on the Make.com side at all."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No spreadsheet file was sent.'}), 400
-    target_month = request.form.get('target_month')
-    sheet_name = request.form.get('sheet_name', 'pending_approval')
-    if not target_month:
-        return jsonify({'error': 'target_month is required.'}), 400
-
-    uploaded = request.files['file']
-    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-        uploaded.save(tmp.name)
-        tmp_path = tmp.name
-
-    try:
-        import openpyxl as oxl
-        from collections import Counter, defaultdict
-        wb = oxl.load_workbook(tmp_path)
-
-        ws_pa = wb[sheet_name]
-        headers = [ws_pa.cell(1, c).value for c in range(1, ws_pa.max_column + 1)]
-        num_col = headers.index('#') + 1
-        name_col = headers.index('Product Name') + 1
-        status_col = headers.index('STATUS ✏️') + 1
-
-        current_customer = None
-        approved = defaultdict(list)
-        for row in ws_pa.iter_rows(min_row=1, values_only=True):
-            fc = row[0]
-            if isinstance(fc, str) and '|' in fc and 'Month:' in fc:
-                current_customer = fc.split('|')[0].strip()
-                continue
-            n = row[num_col-1]
-            if isinstance(n, (int, float)) and row[status_col-1] == 'approved':
-                approved[current_customer].append(row[name_col-1])
-
-        wsc = wb['customers']
-        hc = [wsc.cell(1, c).value for c in range(1, wsc.max_column + 1)]
-        name_col_c = hc.index('name') + 1
-        cid_col = hc.index('customer_id') + 1
-        box_col = hc.index('box_type') + 1
-        name_to_id, name_to_boxtype = {}, {}
-        for r in wsc.iter_rows(min_row=2, values_only=True):
-            if r[name_col_c-1]:
-                name_to_id[r[name_col_c-1]] = r[cid_col-1]
-                name_to_boxtype[r[name_col_c-1]] = r[box_col-1]
-
-        ws_boxes = wb['boxes']
-        ws_items = wb['box_items']
-        next_box_num = ws_boxes.max_row + 1
-        next_item_num = ws_items.max_row
-
-        usage = Counter()
-        committed_customers = []
-        for cust_name, products in approved.items():
-            cid = name_to_id.get(cust_name)
-            if not cid or not products:
-                continue
-            box_id = f'BOX{next_box_num:04d}'
-            next_box_num += 1
-            box_type = name_to_boxtype.get(cust_name)
-            ws_boxes.append([box_id, cid, cust_name, target_month, 'sent', box_type])
-            for prod in products:
-                next_item_num += 1
-                ws_items.append([f'BI{next_item_num:05d}', cust_name, cid, target_month, box_type, box_id, prod])
-                usage[prod] += 1
-            committed_customers.append(cust_name)
-
-        ws_inv = wb['inventory']
-        hi = [ws_inv.cell(1, c).value for c in range(1, ws_inv.max_column + 1)]
-        n_col = hi.index('name') + 1
-        s_col = hi.index('stock_qty') + 1
-        for row in ws_inv.iter_rows(min_row=2):
-            name = row[n_col-1].value
-            if name in usage:
-                old = row[s_col-1].value or 0
-                row[s_col-1].value = max(0, old - usage[name])
-
-        wb.save(tmp_path)
-
-        from flask import send_file
-        return send_file(tmp_path, as_attachment=True,
-                          download_name='snatched_beauty_box_master_updated.xlsx')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
