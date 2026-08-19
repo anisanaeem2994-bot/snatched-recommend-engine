@@ -244,8 +244,16 @@ def customer_lookup_endpoint():
             'customer_name': cust['name'],
             'customer_id': cid,
             'status': cust.get('status'),
+            'email': cust.get('email'),
+            'phone': cust.get('phone'),
+            'city': cust.get('city'),
+            'payment_type': cust.get('payment'),
             'box_type': cust.get('box_type'),
-            'billing_cadence': cust.get('billing_cadence'),
+            # NOTE: load_customers() stores this under the key 'cadence' (that's
+            # also the exact key is_customer_due() reads for bi-monthly timing --
+            # do not rename it there). 'billing_cadence' below is just this
+            # endpoint's own output field name for the dashboard to display/edit.
+            'billing_cadence': cust.get('cadence'),
             'subscribed_since': cust.get('subscribed_since'),
             'birthday': cust.get('birthday'),
             'notes': cust.get('notes'),
@@ -499,6 +507,156 @@ def dashboard_set_customer_notes():
         wb.save(recommend_v5.path)
         push_to_github()
         return jsonify({'success': True, 'notes': notes})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# customers sheet column numbers (1-based) for every field Iqra is allowed
+# to fill in or correct herself. name/email/phone/city/birthday cover gaps
+# an automated intake email couldn't fill; payment_type/box_type/billing_cadence
+# cover the exact ambiguity flagged for Essentials/Prestige signups (Mixed
+# tiers are always Monthly, so those never need asking).
+CUSTOMER_EDITABLE_FIELDS = {
+    'name': 2, 'email': 3, 'phone': 4, 'payment_type': 6, 'box_type': 7,
+    'billing_cadence': 8, 'city': 9, 'birthday': 10, 'subscribed_since': 11,
+    'first_box_month': 12,
+}
+
+@app.route('/dashboard/edit_customer', methods=['POST'])
+@dashboard_login_required
+def dashboard_edit_customer():
+    """Lets Iqra fill in or correct any of a customer's core details --
+    e.g. an automated intake email didn't mention Monthly vs Bi-Monthly,
+    or a phone/city was missing or wrong. Only touches fields actually
+    present in the request, so a partial edit never wipes out fields it
+    wasn't given. Whatever gets saved here is the exact same live file
+    the recommend engine reads from, so it's picked up automatically the
+    next time a box is generated for her -- no separate sync step."""
+    customer_id = request.form.get('customer_id')
+    if not customer_id:
+        return jsonify({'error': 'customer_id is required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        target_row = None
+        for row in ws_c.iter_rows(min_row=2):
+            if row[0].value == customer_id:
+                target_row = row
+                break
+        if not target_row:
+            return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
+
+        updated_fields = {}
+        for field, col in CUSTOMER_EDITABLE_FIELDS.items():
+            if field in request.form:
+                value = request.form.get(field)
+                target_row[col - 1].value = value
+                updated_fields[field] = value
+
+        if not updated_fields:
+            return jsonify({'error': 'No editable fields were sent.'}), 400
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'customer_id': customer_id, 'updated': updated_fields})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/edit_preferences', methods=['POST'])
+@dashboard_login_required
+def dashboard_edit_preferences():
+    """Lets Iqra correct a customer's quiz answers, category frequencies
+    (Often/Sometimes/Rarely), and style preferences straight from the
+    dashboard -- for whenever she learns something new about a customer
+    outside of any automated quiz email, or a resubmission comes in and
+    she'd rather just retype the answers herself than trust an
+    auto-overwrite. Same guarantee as every other edit endpoint: this
+    writes into the one live file the engine reads from, so it's picked
+    up automatically the next time a box is built for her -- no separate
+    sync step, no waiting."""
+    customer_id = request.form.get('customer_id')
+    customer_name = request.form.get('customer_name', '')
+    if not customer_id:
+        return jsonify({'error': 'customer_id is required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        updated = {}
+
+        # -- quiz_responses: one row per customer (skin_tone/eye_color/
+        # hair_color/makeup_comfort). If she's never had a row here yet,
+        # a new one is created rather than silently doing nothing.
+        quiz_cols = {'skin_tone': 4, 'eye_color': 5, 'hair_color': 6, 'makeup_comfort': 7}
+        sent_quiz = {f: request.form.get(f) for f in quiz_cols if f in request.form}
+        if sent_quiz:
+            ws_q = wb['quiz_responses']
+            target = None
+            for row in ws_q.iter_rows(min_row=2):
+                if row[1].value == customer_id:
+                    target = row  # last match wins -- matches load_quiz()'s own behavior
+            if target is None:
+                new_row = _next_append_row(ws_q)
+                ws_q.cell(new_row, 1).value = f'QZ-{customer_id}-manual'
+                ws_q.cell(new_row, 2).value = customer_id
+                ws_q.cell(new_row, 3).value = customer_name
+                for f, v in sent_quiz.items():
+                    ws_q.cell(new_row, quiz_cols[f]).value = v
+            else:
+                for f, v in sent_quiz.items():
+                    target[quiz_cols[f] - 1].value = v
+            updated['quiz'] = sent_quiz
+
+        # -- quiz_frequencies: one row per (customer_id, category). Send
+        # as freq_<category>=<Often|Sometimes|Rarely> form fields.
+        freq_updates = {k[5:]: v for k, v in request.form.items() if k.startswith('freq_') and v}
+        if freq_updates:
+            ws_f = wb['quiz_frequencies']
+            found_cats = set()
+            for row in ws_f.iter_rows(min_row=2):
+                cid, cat = row[1].value, row[3].value
+                if cid == customer_id and cat in freq_updates:
+                    row[4].value = freq_updates[cat]
+                    found_cats.add(cat)
+            for cat, level in freq_updates.items():
+                if cat not in found_cats:
+                    new_row = _next_append_row(ws_f)
+                    ws_f.cell(new_row, 2).value = customer_id
+                    ws_f.cell(new_row, 3).value = customer_name
+                    ws_f.cell(new_row, 4).value = cat
+                    ws_f.cell(new_row, 5).value = level
+            updated['frequencies'] = freq_updates
+
+        # -- quiz_preferences: MULTIPLE rows can share the same
+        # (customer_id, key) -- e.g. a multi-select "shopping style"
+        # question. Send as pref_<key>=<comma, separated, values> and
+        # this replaces the FULL set of values under that key.
+        pref_updates = {k[5:]: v for k, v in request.form.items() if k.startswith('pref_')}
+        if pref_updates:
+            ws_p = wb['quiz_preferences']
+            keys_sent = set(pref_updates.keys())
+            rows_to_delete = [
+                r for r in range(ws_p.max_row, 1, -1)
+                if ws_p.cell(r, 2).value == customer_id and ws_p.cell(r, 4).value in keys_sent
+            ]
+            for r in rows_to_delete:
+                ws_p.delete_rows(r, 1)
+            for key, raw_values in pref_updates.items():
+                for v in [x.strip() for x in raw_values.split(',') if x.strip()]:
+                    new_row = _next_append_row(ws_p)
+                    ws_p.cell(new_row, 2).value = customer_id
+                    ws_p.cell(new_row, 3).value = customer_name
+                    ws_p.cell(new_row, 4).value = key
+                    ws_p.cell(new_row, 5).value = v
+            updated['preferences'] = pref_updates
+
+        if not updated:
+            return jsonify({'error': 'No preference fields were sent.'}), 400
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'customer_id': customer_id, 'updated': updated})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1143,12 +1301,20 @@ def dashboard_generate_month():
         all_rec, recent_boxes, box_timeline = recommend_v5.load_box_history()
 
         built = 0
+        skipped = []
         for cid, cust in customers.items():
             due, reason = recommend_v5.is_customer_due(cust, box_timeline, target_month)
             if not due:
+                skipped.append({'name': cust['name'], 'reason': reason})
                 continue
             out = recommend_v5.recommend(cust['name'])
             if isinstance(out, str):
+                # recommend() returns a plain string instead of raising when
+                # it can't build a box for a real, known reason (e.g. an
+                # unset/unrecognized box type) -- most commonly a new or
+                # tier-unconfirmed customer like "add Darya once she
+                # confirms her tier." Surface it instead of failing silently.
+                skipped.append({'name': cust['name'], 'reason': out})
                 continue
             (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
              hist_pat, total, timeline, inv_cat_map, value_summary) = out
@@ -1179,7 +1345,89 @@ def dashboard_generate_month():
 
         wb.save(recommend_v5.path)
         push_to_github()
-        return jsonify({'success': True, 'target_month': target_month, 'customers_built': built})
+        return jsonify({
+            'success': True, 'target_month': target_month, 'customers_built': built,
+            'skipped': skipped,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/generate_for_customer', methods=['POST'])
+@dashboard_login_required
+def dashboard_generate_for_customer():
+    """Builds a box for exactly ONE customer and adds her to the working
+    board, without touching anyone else already there or re-building
+    anyone whose box for this month is already committed. For the exact
+    case of a customer who was skipped from the normal month generation
+    (e.g. her tier wasn't confirmed yet) -- once she confirms, use this
+    to add just her, any time, even after the rest of the month has
+    already been committed."""
+    customer_id = request.form.get('customer_id')
+    target_month = request.form.get('target_month')
+    if not customer_id or not target_month:
+        return jsonify({'error': 'customer_id and target_month are required.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+
+        customers = recommend_v5.load_customers()
+        cust = customers.get(customer_id)
+        if not cust:
+            return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
+
+        # Refuse if she already has a real, committed box for this exact
+        # month -- the #1 thing this endpoint exists to prevent.
+        ws_boxes = wb['boxes']
+        for row in ws_boxes.iter_rows(min_row=2, values_only=True):
+            if row[1] == customer_id and str(row[3]) == target_month and str(row[4]).strip().lower() != 'cancelled':
+                return jsonify({'error': f'{cust["name"]} already has a committed box for {target_month} ({row[0]}).'}), 409
+
+        existing = _get_dash_sheet(create=False)
+        existing_blocks = _parse_dash_sheet(existing) if existing is not None else []
+        if any(b['customer_id'] == customer_id and b.get('month') == target_month for b in existing_blocks):
+            return jsonify({'error': f'{cust["name"]} is already on the board for {target_month}.'}), 409
+
+        recommend_v5.set_target_month(target_month)
+        recommend_v5.reset_allocations()
+        # reset_allocations() clears the per-run duplicate-brand/subcategory
+        # tracking that's meant to keep ONE MONTH's boxes from repeating the
+        # same brand across customers -- since this runs standalone (not as
+        # part of a full-month build), it starts with a clean slate rather
+        # than sharing state with whatever was last generated.
+
+        out = recommend_v5.recommend(cust['name'])
+        if isinstance(out, str):
+            return jsonify({'error': out}), 400
+        (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
+         hist_pat, total, timeline, inv_cat_map, value_summary) = out
+
+        prefs = recommend_v5.load_preferences().get(customer_id, {})
+        freqs = recommend_v5.load_frequencies().get(customer_id, {})
+        quiz = recommend_v5.load_quiz().get(customer_id, {})
+        age = ''
+        bday = cust.get('birthday')
+        if bday:
+            try:
+                bdate = _datetime.strptime(str(bday)[:10], '%Y-%m-%d')
+                today = _datetime.now()
+                age = today.year - bdate.year - ((today.month, today.day) < (bdate.month, bdate.day))
+            except Exception:
+                age = ''
+
+        ws = _get_dash_sheet(create=True)
+        ws.append([f'HEADER: {c["name"]}', customer_id, c['box_type'], target_month])
+        for i, p in enumerate(picks, start=1):
+            why_text = recommend_v5.build_explanation(
+                p, customer_id, hard_block, soft_avoid, hist_pat, total,
+                timeline, inv_cat_map, prefs, freqs, quiz, age, cust.get('notes', '')
+            )
+            ws.append([i, p['name'], p['category'], p['tier'], p['stock'],
+                       why_text, 'Pending', False, p.get('retail_price_aed')])
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({'success': True, 'customer_name': c['name'], 'target_month': target_month})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1253,6 +1501,64 @@ def dashboard_home_stats():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/dashboard/months', methods=['GET'])
+@dashboard_login_required
+def dashboard_months():
+    """Every month that's ever had a box committed, newest first --
+    powers the 'Past months' browser so Iqra can look back at any
+    month's full history without hunting it one customer at a time."""
+    try:
+        importlib.reload(recommend_v5)
+        ws_b = recommend_v5.wb['boxes']
+        months = sorted({str(row[3]) for row in ws_b.iter_rows(min_row=2, values_only=True) if row[3]}, reverse=True)
+        return jsonify({'months': months})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/month_detail', methods=['GET'])
+@dashboard_login_required
+def dashboard_month_detail():
+    """Full detail for one past (committed) month: every box that went
+    out, who got it, and exactly what was in it -- everything Iqra
+    would otherwise have to hunt for customer-by-customer. Cancelled
+    boxes for that month are included too, but counted separately, so
+    a month never silently looks like it shipped more than it did."""
+    month = request.args.get('month')
+    if not month:
+        return jsonify({'error': 'month is required, e.g. ?month=2026-09'}), 400
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws_b = wb['boxes']
+        ws_i = wb['box_items']
+
+        boxes = [
+            {'box_id': row[0], 'customer_id': row[1], 'customer_name': row[2],
+             'status': row[4], 'box_type': row[5]}
+            for row in ws_b.iter_rows(min_row=2, values_only=True) if str(row[3]) == month
+        ]
+        if not boxes:
+            return jsonify({'month': month, 'box_count': 0, 'sent_count': 0, 'cancelled_count': 0, 'boxes': []})
+
+        items_by_box = {}
+        for row in ws_i.iter_rows(min_row=2, values_only=True):
+            if row[3] and str(row[3]) == month and row[5] and row[6]:
+                items_by_box.setdefault(row[5], []).append(row[6])
+
+        for b in boxes:
+            b['products'] = items_by_box.get(b['box_id'], [])
+        boxes.sort(key=lambda b: (b['customer_name'] or '').lower())
+
+        sent_count = sum(1 for b in boxes if str(b['status']).strip().lower() != 'cancelled')
+        cancelled_count = len(boxes) - sent_count
+
+        return jsonify({
+            'month': month, 'box_count': len(boxes), 'sent_count': sent_count,
+            'cancelled_count': cancelled_count, 'boxes': boxes,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/dashboard/all_customers', methods=['GET'])
 @dashboard_login_required
 def dashboard_all_customers():
@@ -1288,6 +1594,96 @@ def dashboard_inventory():
         return jsonify({'items': items})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/add_inventory', methods=['POST'])
+@dashboard_login_required
+def dashboard_add_inventory():
+    """Lets Iqra add new stock straight from the dashboard -- no
+    spreadsheet needed. If the product name already exists (exact match,
+    case-insensitive), its stock_qty is just increased by the amount
+    given. If it's a brand-new product, a new inventory row is created
+    with a freshly-generated product_id, continuing the same NEW####
+    numbering already used for hand-added products in this sheet."""
+    name = (request.form.get('name') or '').strip()
+    qty_raw = request.form.get('quantity')
+    category = (request.form.get('category') or '').strip()
+    tier = (request.form.get('tier') or '').strip()
+    price_raw = request.form.get('retail_price_aed')
+
+    if not name:
+        return jsonify({'error': 'name is required.'}), 400
+    try:
+        qty = int(qty_raw)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'quantity must be a whole number.'}), 400
+    if qty <= 0:
+        return jsonify({'error': 'quantity must be greater than 0.'}), 400
+
+    try:
+        importlib.reload(recommend_v5)
+        wb = recommend_v5.wb
+        ws = wb['inventory']
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        n_col = headers.index('name') + 1
+        s_col = headers.index('stock_qty') + 1
+        id_col = headers.index('product_id') + 1
+        cat_col = headers.index('category') + 1
+        tier_col = headers.index('tier') + 1
+        price_col = headers.index('retail_price_aed') + 1
+
+        name_lower = name.lower()
+        max_num = 0
+        for r in range(2, ws.max_row + 1):
+            pid = ws.cell(r, id_col).value
+            existing_name = ws.cell(r, n_col).value
+            if pid:
+                digits = ''.join(ch for ch in str(pid) if ch.isdigit())
+                if digits:
+                    max_num = max(max_num, int(digits))
+            if existing_name and str(existing_name).strip().lower() == name_lower:
+                new_stock = (ws.cell(r, s_col).value or 0) + qty
+                ws.cell(r, s_col).value = new_stock
+                wb.save(recommend_v5.path)
+                push_to_github()
+                return jsonify({
+                    'success': True, 'created_new': False, 'name': existing_name,
+                    'new_stock': new_stock,
+                })
+
+        new_id = f'NEW{max_num + 1:04d}'
+        new_row_num = _next_append_row(ws, check_cols=(id_col, n_col))
+        ws.cell(new_row_num, id_col).value = new_id
+        ws.cell(new_row_num, n_col).value = name
+        ws.cell(new_row_num, tier_col).value = tier
+        ws.cell(new_row_num, cat_col).value = category
+        ws.cell(new_row_num, s_col).value = qty
+        if price_raw:
+            try:
+                ws.cell(new_row_num, price_col).value = float(price_raw)
+            except ValueError:
+                pass
+
+        wb.save(recommend_v5.path)
+        push_to_github()
+        return jsonify({
+            'success': True, 'created_new': True, 'product_id': new_id,
+            'name': name, 'new_stock': qty,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def _next_append_row(ws, check_cols=(1, 2)):
+    """Returns the row number to write a brand-new row into. Several
+    sheets in this workbook have thousands of pre-formatted-but-empty
+    trailing rows, which makes ws.max_row unreliable for finding 'the
+    real last row of data' -- using it directly would leave a huge gap
+    of blank rows before a freshly appended one. This scans for the
+    actual last row that has something in it instead."""
+    last = 1
+    for r in range(2, ws.max_row + 1):
+        if any(ws.cell(r, c).value not in (None, '') for c in check_cols):
+            last = r
+    return last + 1
 
 def _restock_product_by_name(wb, product_name):
     """Puts one unit of a product back into inventory by name. Used

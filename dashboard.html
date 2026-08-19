@@ -291,6 +291,44 @@
     </div>
 
     <div class="panel">
+      <h3>📦 Add inventory</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Type a product name. If it already exists, this just adds to its current stock count — if it's brand new, it creates the product for you. No spreadsheet needed.</div>
+      <div class="row-line" style="gap:8px;flex-wrap:wrap;align-items:flex-start;">
+        <input id="addInvName" list="addInvNameList" placeholder="Product name…" style="flex:2;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <datalist id="addInvNameList"></datalist>
+        <select id="addInvCategory" class="cat-select" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+          <option value="">Category (new products only)</option>
+        </select>
+        <select id="addInvTier" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+          <option value="">Tier (new products only)</option>
+          <option value="Essentials">Essentials</option>
+          <option value="Mixed Glam X">Mixed Glam X</option>
+          <option value="Mixed Glam XXX">Mixed Glam XXX</option>
+          <option value="Prestige">Prestige</option>
+        </select>
+      </div>
+      <div class="row-line" style="gap:8px;margin-top:8px;">
+        <button class="btn btn-outline" onclick="stepInvQty(-1)" style="padding:6px 12px;">−</button>
+        <input id="addInvQty" type="number" min="1" value="1" style="width:60px;text-align:center;padding:8px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <button class="btn btn-outline" onclick="stepInvQty(1)" style="padding:6px 12px;">+</button>
+        <button class="btn btn-approve" onclick="addInventory()">Add to inventory</button>
+      </div>
+      <div class="empty-note" id="addInvResult" style="display:none;"></div>
+    </div>
+
+    <div class="panel">
+      <h3>📅 Past months</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Look back at any month that's already gone out — who got a box, and exactly what was in it.</div>
+      <div class="row-line" style="gap:8px;flex-wrap:wrap;">
+        <select id="pastMonthSelect" style="flex:1;min-width:160px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+          <option value="">Loading months…</option>
+        </select>
+        <button class="btn btn-swap" onclick="viewPastMonth()">View</button>
+      </div>
+      <div id="pastMonthResult" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="panel">
       <h3>✅ Quick actions</h3>
       <div class="row-line"><span>Review & approve this month's boxes</span><button class="btn btn-approve" onclick="showPage('review')">Go to review →</button></div>
       <div class="row-line"><span>Check a customer's history before deciding a swap</span><button class="btn btn-swap" onclick="showPage('customers')">Search a customer →</button></div>
@@ -453,6 +491,12 @@ async function generateMonth(force){
       return;
     }
     if(res.error){ warnEl.textContent = '⚠ ' + res.error; warnEl.style.display='block'; return; }
+    if(res.skipped && res.skipped.length){
+      warnEl.innerHTML = `ℹ️ ${res.skipped.length} customer${res.skipped.length===1?'':'s'} skipped this month:<br>` +
+        res.skipped.map(s => `&nbsp;&nbsp;• <strong>${s.name}</strong> — ${s.reason}`).join('<br>') +
+        `<br><br>Once a skipped customer's tier/status is sorted, search her under Customers and use "Generate her box for a month" to add her separately — no need to regenerate everyone else.`;
+      warnEl.style.display = 'block';
+    }
     await loadBoard();
     showPage('review');
   }catch(e){
@@ -550,7 +594,86 @@ async function ensureInventory(){
       sel.appendChild(opt);
     });
   });
+  const nameList = document.getElementById('addInvNameList');
+  if(nameList){
+    nameList.innerHTML = inventoryCatalog.map(p=>`<option value="${(p.name||'').replace(/"/g,'&quot;')}"></option>`).join('');
+  }
   return inventoryCatalog;
+}
+
+async function loadPastMonths(){
+  const sel = document.getElementById('pastMonthSelect');
+  try{
+    const data = await api('/dashboard/months');
+    const months = (data && data.months) || [];
+    if(!months.length){
+      sel.innerHTML = `<option value="">No committed months yet</option>`;
+      return;
+    }
+    sel.innerHTML = months.map(m => `<option value="${m}">${m}</option>`).join('');
+  }catch(e){
+    sel.innerHTML = `<option value="">Couldn't load months</option>`;
+  }
+}
+
+async function viewPastMonth(){
+  const sel = document.getElementById('pastMonthSelect');
+  const resultEl = document.getElementById('pastMonthResult');
+  const month = sel.value;
+  if(!month){ return; }
+  resultEl.innerHTML = `<div class="empty-note">Loading…</div>`;
+  try{
+    const data = await api('/dashboard/month_detail?month=' + encodeURIComponent(month));
+    if(!data || data.error){
+      resultEl.innerHTML = `<div class="empty-note">${(data && data.error) || 'Could not load that month.'}</div>`;
+      return;
+    }
+    if(!data.box_count){
+      resultEl.innerHTML = `<div class="empty-note">No boxes on record for ${month}.</div>`;
+      return;
+    }
+    resultEl.innerHTML = `
+      <div class="row-line"><span><strong>${data.sent_count}</strong> box${data.sent_count===1?'':'es'} went out in ${month}${data.cancelled_count ? ` <span style="color:var(--muted);">(+${data.cancelled_count} cancelled)</span>` : ''}</span></div>
+      ${data.boxes.map(b => `
+        <div class="history-month">
+          <div class="history-month-label">${b.customer_name} <span class="pill ${String(b.status).toLowerCase()==='cancelled' ? 'red' : 'green'}" style="margin-left:6px;">${b.status}</span></div>
+          <div class="history-items">
+            ${(b.products||[]).map(p=>`<span class="history-item">${p}</span>`).join('') || '<span class="empty-note">No items on record</span>'}
+          </div>
+        </div>
+      `).join('')}
+    `;
+  }catch(e){
+    resultEl.innerHTML = `<div class="empty-note">Could not load that month: ${e.message}</div>`;
+  }
+}
+
+function stepInvQty(delta){
+  const el = document.getElementById('addInvQty');
+  const v = Math.max(1, (parseInt(el.value, 10) || 1) + delta);
+  el.value = v;
+}
+
+async function addInventory(){
+  const name = document.getElementById('addInvName').value.trim();
+  const qty = parseInt(document.getElementById('addInvQty').value, 10) || 0;
+  const category = document.getElementById('addInvCategory').value;
+  const tier = document.getElementById('addInvTier').value;
+  const resultEl = document.getElementById('addInvResult');
+  if(!name){ alert('Type a product name first.'); return; }
+  if(qty <= 0){ alert('Quantity must be at least 1.'); return; }
+  try{
+    const data = await postForm('/dashboard/add_inventory', { name, quantity: qty, category, tier });
+    if(!data || data.error){ alert('Could not add inventory: ' + ((data && data.error) || 'unknown error')); return; }
+    resultEl.style.display = 'block';
+    resultEl.textContent = data.created_new
+      ? `Created new product "${data.name}" — now ${data.new_stock} in stock.`
+      : `"${data.name}" now has ${data.new_stock} in stock.`;
+    document.getElementById('addInvName').value = '';
+    document.getElementById('addInvQty').value = 1;
+    inventoryCatalog = null; // force a refresh so this shows up next time it's used
+    ensureInventory();
+  }catch(e){ alert('Could not add inventory: ' + e.message); }
 }
 
 async function doSwap(rowNumber){
@@ -755,6 +878,40 @@ async function renderProfileInto(targetId, name){
         <div style="font-size:11.5px;color:var(--muted);margin-top:5px;">Cancelling stops future months from generating a box for her. It doesn't touch a box already committed — cancel that individually below if it hasn't gone out.</div>
       </div>
 
+      <h3 style="margin-top:18px;">Edit details</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Fill in or fix anything below — only what you change here gets saved, nothing else is touched. Useful when a signup email didn't say Monthly vs Bi-Monthly, or a phone/city is missing.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <label style="font-size:12px;color:var(--muted);">Email
+          <input id="editEmail-${targetId}" value="${(data.email||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Phone
+          <input id="editPhone-${targetId}" value="${(data.phone||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">City
+          <input id="editCity-${targetId}" value="${(data.city||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Birthday (YYYY-MM-DD)
+          <input id="editBirthday-${targetId}" value="${(data.birthday||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Payment type
+          <input id="editPayment-${targetId}" value="${(data.payment_type||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Box type / tier
+          <input id="editBoxType-${targetId}" value="${(data.box_type||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Billing cadence
+          <select id="editCadence-${targetId}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+            <option value="">— not set —</option>
+            <option value="Monthly" ${String(data.billing_cadence||'').toLowerCase()==='monthly' ? 'selected' : ''}>Monthly</option>
+            <option value="Bi-Monthly" ${String(data.billing_cadence||'').toLowerCase()==='bi-monthly' ? 'selected' : ''}>Bi-Monthly</option>
+          </select>
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Subscribed since (YYYY-MM-DD)
+          <input id="editSubSince-${targetId}" value="${(data.subscribed_since||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+      </div>
+      <div style="margin-top:8px;"><button class="btn btn-swap" onclick="saveCustomerEdit('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save changes</button></div>
+
       ${data.boxes && data.boxes.length ? `
       <h3 style="margin-top:4px;">Her boxes</h3>
       ${data.boxes.map(b => `
@@ -767,6 +924,13 @@ async function renderProfileInto(targetId, name){
         </div>
       `).join('')}
       ` : ''}
+
+      <h3 style="margin-top:18px;">Generate her box for a month</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">For a customer who was skipped when a month was generated (e.g. her tier wasn't confirmed yet) — add just her to the board any time, even after everyone else that month is already committed. If she already has a committed box for the month you pick, this will refuse rather than double it up.</div>
+      <div class="row-line" style="gap:8px;">
+        <input id="genForMonth-${targetId}" type="month" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <button class="btn btn-swap" onclick="generateForCustomer('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Generate her box</button>
+      </div>
 
       <h3 style="margin-top:18px;">Blocked brands</h3>
       <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">A blocked brand is never suggested for her again, in any category — for a full "no [brand] products" request. For one specific product only, reject it during a normal swap instead.</div>
@@ -799,26 +963,40 @@ async function renderProfileInto(targetId, name){
       <textarea id="notesArea-${targetId}" rows="3" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;">${data.notes || ''}</textarea>
       <div style="margin-top:6px;"><button class="btn btn-swap" onclick="saveNotes('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save notes</button></div>
 
-      ${Object.keys(freqGroups).length ? `
-      <h3 style="margin-top:18px;">How often she wants each category</h3>
-      ${freqOrder.concat(extraFreqLevels).map(level => freqGroups[level] && freqGroups[level].length ? `
-        <div class="row-line"><span>${level}</span><span class="pill ${freqPillClass[level] || 'amber'}">${freqGroups[level].join(', ')}</span></div>
-      ` : '').join('')}
+      <h3 style="margin-top:18px;">Edit preferences &amp; quiz answers</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Fix anything below yourself — a quiz answer that came in wrong, or how often she really wants a category. Saved changes apply to her next box automatically.</div>
+
+      ${Object.keys(data.frequencies||{}).length ? `
+      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:10px 0 4px;">How often she wants each category</div>
+      ${Object.entries(data.frequencies).map(([cat, level]) => `
+        <div class="row-line">
+          <span>${labelize(cat)}</span>
+          <select id="editFreq-${targetId}-${cat}" data-cat="${cat}" class="edit-freq-select" style="padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;">
+            <option value="Often" ${level==='Often'?'selected':''}>Often</option>
+            <option value="Sometimes" ${level==='Sometimes'?'selected':''}>Sometimes</option>
+            <option value="Rarely" ${level==='Rarely'?'selected':''}>Rarely</option>
+          </select>
+        </div>
+      `).join('')}
       ` : ''}
 
       ${data.preferences && Object.keys(data.preferences).length ? `
-      <h3 style="margin-top:18px;">Style &amp; shopping preferences</h3>
+      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:14px 0 4px;">Style &amp; shopping preferences</div>
       ${Object.entries(data.preferences).map(([k,v]) => `
-        <div class="row-line"><span>${labelize(k)}</span><span class="pill amber">${(Array.isArray(v)?v:[v]).filter(Boolean).join(', ') || '—'}</span></div>
+        <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;">${labelize(k)}
+          <input id="editPref-${targetId}-${k}" data-key="${k}" class="edit-pref-input" value="${((Array.isArray(v)?v:[v]).filter(Boolean).join(', ')).replace(/"/g,'&quot;')}" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:2px;">
+        </label>
       `).join('')}
       ` : ''}
 
-      ${data.quiz && Object.keys(data.quiz).length ? `
-      <h3 style="margin-top:18px;">Quiz answers</h3>
-      ${Object.entries(data.quiz).map(([k,v]) => `
-        <div class="row-line"><span>${labelize(k)}</span><span class="pill green">${v || '—'}</span></div>
+      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:14px 0 4px;">Quiz answers</div>
+      ${['skin_tone','eye_color','hair_color','makeup_comfort'].map(k => `
+        <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;">${labelize(k)}
+          <input id="editQuiz-${targetId}-${k}" value="${((data.quiz||{})[k] || '').toString().replace(/"/g,'&quot;')}" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:2px;">
+        </label>
       `).join('')}
-      ` : ''}
+
+      <div style="margin-top:10px;"><button class="btn btn-swap" onclick="savePreferences('${data.customer_id}','${targetId}','${data.customer_name.replace(/'/g,"\\'")}')">Save preference changes</button></div>
 
       <div class="check-box">
         <label>💬 "Has she received this before?"</label>
@@ -851,6 +1029,60 @@ async function setCustomerStatus(customerId, targetId, customerName, newStatus){
     if(!data || data.error){ alert('Could not update status: ' + ((data && data.error) || 'unknown error')); return; }
     renderProfileInto(targetId, customerName);
   }catch(e){ alert('Could not update status: ' + e.message); }
+}
+
+async function saveCustomerEdit(customerId, targetId, customerName){
+  const val = (id) => { const el = document.getElementById(id+'-'+targetId); return el ? el.value.trim() : ''; };
+  const payload = {
+    customer_id: customerId,
+    email: val('editEmail'),
+    phone: val('editPhone'),
+    city: val('editCity'),
+    birthday: val('editBirthday'),
+    payment_type: val('editPayment'),
+    box_type: val('editBoxType'),
+    billing_cadence: val('editCadence'),
+    subscribed_since: val('editSubSince'),
+  };
+  try{
+    const data = await postForm('/dashboard/edit_customer', payload);
+    if(!data || data.error){ alert('Could not save: ' + ((data && data.error) || 'unknown error')); return; }
+    alert('Details updated.');
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not save: ' + e.message); }
+}
+
+async function savePreferences(customerId, targetId, customerName){
+  const payload = { customer_id: customerId, customer_name: customerName };
+  document.querySelectorAll(`#${targetId} .edit-freq-select`).forEach(sel=>{
+    payload['freq_' + sel.dataset.cat] = sel.value;
+  });
+  document.querySelectorAll(`#${targetId} .edit-pref-input`).forEach(inp=>{
+    payload['pref_' + inp.dataset.key] = inp.value;
+  });
+  ['skin_tone','eye_color','hair_color','makeup_comfort'].forEach(k=>{
+    const el = document.getElementById('editQuiz-'+targetId+'-'+k);
+    if(el) payload[k] = el.value;
+  });
+  if(!confirm(`Save these preference/quiz changes for ${customerName}? This will apply to her next box recommendation.`)) return;
+  try{
+    const data = await postForm('/dashboard/edit_preferences', payload);
+    if(!data || data.error){ alert('Could not save: ' + ((data && data.error) || 'unknown error')); return; }
+    alert('Preferences updated.');
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not save: ' + e.message); }
+}
+
+async function generateForCustomer(customerId, targetId, customerName){
+  const monthEl = document.getElementById('genForMonth-'+targetId);
+  const month = monthEl ? monthEl.value : '';
+  if(!month){ alert('Pick a month first.'); return; }
+  try{
+    const data = await postForm('/dashboard/generate_for_customer', { customer_id: customerId, target_month: month });
+    if(!data || data.error){ alert('Could not generate her box: ' + ((data && data.error) || 'unknown error')); return; }
+    alert(`${data.customer_name}'s box for ${data.target_month} was added to the board. Go to "This Month" to review, swap, and approve it.`);
+    renderProfileInto(targetId, customerName);
+  }catch(e){ alert('Could not generate her box: ' + e.message); }
 }
 
 async function cancelBox(boxId, targetId, customerName){
@@ -913,6 +1145,8 @@ async function checkProduct(targetId, customerName){
 
 /* ---------------- init ---------------- */
 loadBoard();
+ensureInventory();
+loadPastMonths();
 </script>
 
 </body>
