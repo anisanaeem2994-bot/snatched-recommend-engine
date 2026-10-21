@@ -27,6 +27,7 @@ Endpoints:
 """
 from flask import Flask, request, jsonify, session, redirect, url_for
 import os
+import re
 import tempfile
 import importlib
 import recommend_v5
@@ -418,17 +419,33 @@ def customer_search_product_endpoint():
 @app.route('/dashboard/set_customer_status', methods=['POST'])
 @dashboard_login_required
 def dashboard_set_customer_status():
-    """Lets Iqra mark a customer Cancelled (or reactivate her) straight
-    from the dashboard. This is the ONLY thing that controls whether
-    future months generate a box for her — is_customer_due() in
+    """Lets Iqra mark a customer Cancelled, Paused, or reactivate her
+    straight from the dashboard. This is the ONLY thing that controls
+    whether future months generate a box for her — is_customer_due() in
     recommend_v5 already refuses to build a box for anyone whose status
     isn't 'active', so flipping this cell here is the whole fix for
-    'don't build her a box next month.' It does NOT touch any box
-    that's already been committed — cancel those separately below."""
+    'don't build her a box next month,' for Cancelled OR Paused alike.
+    It does NOT touch any box that's already been committed — cancel
+    those separately below.
+
+    Paused is for a customer taking a temporary break who's expected back
+    (so it's worth keeping distinct from Cancelled for Iqra's own
+    tracking); it has the exact same effect as Cancelled on future box
+    generation and on an open board below. Reactivating from either one
+    just sets her back to Active.
+
+    This DOES clean up an open, not-yet-committed month's board if she's
+    currently sitting on one when paused or cancelled: generate_month only
+    checks who's due at the moment it's clicked, so pausing/cancelling
+    someone afterward (while her box is still un-approved, mid-review)
+    used to leave her box sitting there as if nothing happened. Any of
+    her items already Approved (which means stock was already taken for
+    them) get restocked first, then her whole block is removed from the
+    working sheet."""
     customer_id = request.form.get('customer_id')
     new_status = request.form.get('status')
-    if not customer_id or new_status not in ('Active', 'Cancelled'):
-        return jsonify({'error': 'customer_id and status (Active or Cancelled) are required.'}), 400
+    if not customer_id or new_status not in ('Active', 'Paused', 'Cancelled'):
+        return jsonify({'error': 'customer_id and status (Active, Paused, or Cancelled) are required.'}), 400
 
     try:
         _reload_if_needed()
@@ -445,9 +462,29 @@ def dashboard_set_customer_status():
         if not updated:
             return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
 
+        removed_from_board = False
+        restocked_count = 0
+        if new_status in ('Cancelled', 'Paused'):
+            ws_board = _get_dash_sheet(create=False)
+            if ws_board is not None:
+                blocks = _parse_dash_sheet(ws_board)
+                block = next((b for b in blocks if b['customer_id'] == customer_id), None)
+                if block:
+                    for it in block['items']:
+                        if it['status'] == 'Approved' and it['name']:
+                            if _restock_product_by_name(wb, it['name']):
+                                restocked_count += 1
+                    rows_to_delete = [block['header_row']] + [i['row_number'] for i in block['items']]
+                    for r in sorted(rows_to_delete, reverse=True):
+                        ws_board.delete_rows(r, 1)
+                    removed_from_board = True
+
         wb.save(recommend_v5.path)
         push_to_github_async()
-        return jsonify({'success': True, 'customer_id': customer_id, 'status': new_status})
+        return jsonify({
+            'success': True, 'customer_id': customer_id, 'status': new_status,
+            'removed_from_board': removed_from_board, 'restocked_count': restocked_count,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -685,6 +722,142 @@ def dashboard_edit_customer():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/dashboard/create_customer', methods=['POST'])
+@dashboard_login_required
+def dashboard_create_customer():
+    """Lets Iqra add a brand-new customer straight from the dashboard --
+    for a WhatsApp signup or anything else that comes in outside the
+    Make.com intake flow (which isn't connected yet). Generates the next
+    CUSTOMER_ID herself (continuing whatever numbering is already in the
+    sheet), writes the new row, and — if any quiz/frequency/preference
+    fields were sent along with it — fills those in too via the exact same
+    logic edit_preferences uses, so a new customer can be fully set up,
+    quiz included, in one go instead of create-then-edit.
+
+    Only 'name' is required. Status defaults to Active unless told
+    otherwise. subscribed_since defaults to today if not given, since a
+    brand-new signup is, by definition, subscribing as of right now."""
+    name = (request.form.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name is required.'}), 400
+
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+
+        # Next CUSTOMER_ID, continuing the existing 'C0XX' numbering.
+        max_num = 0
+        for row in ws_c.iter_rows(min_row=2, values_only=True):
+            cid = row[0]
+            if cid:
+                digits = ''.join(ch for ch in str(cid) if ch.isdigit())
+                if digits:
+                    max_num = max(max_num, int(digits))
+        new_id = f'C{max_num + 1:03d}'
+
+        new_row = _next_append_row(ws_c, check_cols=(1, 2))
+        ws_c.cell(new_row, 1).value = new_id
+        ws_c.cell(new_row, 2).value = name
+        ws_c.cell(new_row, 5).value = request.form.get('status') or 'Active'
+        for field, col in CUSTOMER_EDITABLE_FIELDS.items():
+            if field == 'name':
+                continue  # already set above
+            if field in request.form and request.form.get(field):
+                ws_c.cell(new_row, col).value = request.form.get(field)
+        if not request.form.get('subscribed_since'):
+            ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['subscribed_since']).value = _datetime.now().strftime('%Y-%m-%d')
+
+        quiz_updated = _apply_preference_updates(wb, new_id, name, request.form)
+
+        wb.save(recommend_v5.path)
+        push_to_github_async()
+        return jsonify({'success': True, 'customer_id': new_id, 'name': name, 'quiz_updated': quiz_updated})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def _apply_preference_updates(wb, customer_id, customer_name, form):
+    """Shared core of dashboard_edit_preferences() -- writes quiz answers,
+    category frequencies (Often/Sometimes/Rarely), and style preferences
+    into the workbook for one customer, reading the same field names
+    dashboard_edit_preferences's own form does (skin_tone/eye_color/
+    hair_color/makeup_comfort, freg_<category>, pref_<key>). Used both when
+    correcting an existing customer and when filling in her quiz right at
+    creation time, so that logic only lives in one place. `form` is
+    anything dict-like with .get()/.items() and 'in' support -- normally
+    request.form. Does NOT save the workbook -- the caller does that once,
+    same convention as _apply_inventory_change(). Returns the same
+    `updated` dict dashboard_edit_preferences used to return."""
+    updated = {}
+
+    # -- quiz_responses: one row per customer (skin_tone/eye_color/
+    # hair_color/makeup_comfort). If she's never had a row here yet,
+    # a new one is created rather than silently doing nothing.
+    quiz_cols = {'skin_tone': 4, 'eye_color': 5, 'hair_color': 6, 'makeup_comfort': 7}
+    sent_quiz = {f: form.get(f) for f in quiz_cols if f in form}
+    if sent_quiz:
+        ws_q = wb['quiz_responses']
+        target = None
+        for row in ws_q.iter_rows(min_row=2):
+            if row[1].value == customer_id:
+                target = row  # last match wins -- matches load_quiz()'s own behavior
+        if target is None:
+            new_row = _next_append_row(ws_q)
+            ws_q.cell(new_row, 1).value = f'QZ-{customer_id}-manual'
+            ws_q.cell(new_row, 2).value = customer_id
+            ws_q.cell(new_row, 3).value = customer_name
+            for f, v in sent_quiz.items():
+                ws_q.cell(new_row, quiz_cols[f]).value = v
+        else:
+            for f, v in sent_quiz.items():
+                target[quiz_cols[f] - 1].value = v
+        updated['quiz'] = sent_quiz
+
+    # -- quiz_frequencies: one row per (customer_id, category). Send
+    # as freq_<category>=<Often|Sometimes|Rarely> form fields.
+    freq_updates = {k[5:]: v for k, v in form.items() if k.startswith('freq_') and v}
+    if freq_updates:
+        ws_f = wb['quiz_frequencies']
+        found_cats = set()
+        for row in ws_f.iter_rows(min_row=2):
+            cid, cat = row[1].value, row[3].value
+            if cid == customer_id and cat in freq_updates:
+                row[4].value = freq_updates[cat]
+                found_cats.add(cat)
+        for cat, level in freq_updates.items():
+            if cat not in found_cats:
+                new_row = _next_append_row(ws_f)
+                ws_f.cell(new_row, 2).value = customer_id
+                ws_f.cell(new_row, 3).value = customer_name
+                ws_f.cell(new_row, 4).value = cat
+                ws_f.cell(new_row, 5).value = level
+        updated['frequencies'] = freq_updates
+
+    # -- quiz_preferences: MULTIPLE rows can share the same
+    # (customer_id, key) -- e.g. a multi-select "shopping style"
+    # question. Send as pref_<key>=<comma, separated, values> and
+    # this replaces the FULL set of values under that key.
+    pref_updates = {k[5:]: v for k, v in form.items() if k.startswith('pref_')}
+    if pref_updates:
+        ws_p = wb['quiz_preferences']
+        keys_sent = set(pref_updates.keys())
+        rows_to_delete = [
+            r for r in range(ws_p.max_row, 1, -1)
+            if ws_p.cell(r, 2).value == customer_id and ws_p.cell(r, 4).value in keys_sent
+        ]
+        for r in rows_to_delete:
+            ws_p.delete_rows(r, 1)
+        for key, raw_values in pref_updates.items():
+            for v in [x.strip() for x in raw_values.split(',') if x.strip()]:
+                new_row = _next_append_row(ws_p)
+                ws_p.cell(new_row, 2).value = customer_id
+                ws_p.cell(new_row, 3).value = customer_name
+                ws_p.cell(new_row, 4).value = key
+                ws_p.cell(new_row, 5).value = v
+        updated['preferences'] = pref_updates
+
+    return updated
+
 @app.route('/dashboard/edit_preferences', methods=['POST'])
 @dashboard_login_required
 def dashboard_edit_preferences():
@@ -705,73 +878,7 @@ def dashboard_edit_preferences():
     try:
         _reload_if_needed()
         wb = recommend_v5.wb
-        updated = {}
-
-        # -- quiz_responses: one row per customer (skin_tone/eye_color/
-        # hair_color/makeup_comfort). If she's never had a row here yet,
-        # a new one is created rather than silently doing nothing.
-        quiz_cols = {'skin_tone': 4, 'eye_color': 5, 'hair_color': 6, 'makeup_comfort': 7}
-        sent_quiz = {f: request.form.get(f) for f in quiz_cols if f in request.form}
-        if sent_quiz:
-            ws_q = wb['quiz_responses']
-            target = None
-            for row in ws_q.iter_rows(min_row=2):
-                if row[1].value == customer_id:
-                    target = row  # last match wins -- matches load_quiz()'s own behavior
-            if target is None:
-                new_row = _next_append_row(ws_q)
-                ws_q.cell(new_row, 1).value = f'QZ-{customer_id}-manual'
-                ws_q.cell(new_row, 2).value = customer_id
-                ws_q.cell(new_row, 3).value = customer_name
-                for f, v in sent_quiz.items():
-                    ws_q.cell(new_row, quiz_cols[f]).value = v
-            else:
-                for f, v in sent_quiz.items():
-                    target[quiz_cols[f] - 1].value = v
-            updated['quiz'] = sent_quiz
-
-        # -- quiz_frequencies: one row per (customer_id, category). Send
-        # as freq_<category>=<Often|Sometimes|Rarely> form fields.
-        freq_updates = {k[5:]: v for k, v in request.form.items() if k.startswith('freq_') and v}
-        if freq_updates:
-            ws_f = wb['quiz_frequencies']
-            found_cats = set()
-            for row in ws_f.iter_rows(min_row=2):
-                cid, cat = row[1].value, row[3].value
-                if cid == customer_id and cat in freq_updates:
-                    row[4].value = freq_updates[cat]
-                    found_cats.add(cat)
-            for cat, level in freq_updates.items():
-                if cat not in found_cats:
-                    new_row = _next_append_row(ws_f)
-                    ws_f.cell(new_row, 2).value = customer_id
-                    ws_f.cell(new_row, 3).value = customer_name
-                    ws_f.cell(new_row, 4).value = cat
-                    ws_f.cell(new_row, 5).value = level
-            updated['frequencies'] = freq_updates
-
-        # -- quiz_preferences: MULTIPLE rows can share the same
-        # (customer_id, key) -- e.g. a multi-select "shopping style"
-        # question. Send as pref_<key>=<comma, separated, values> and
-        # this replaces the FULL set of values under that key.
-        pref_updates = {k[5:]: v for k, v in request.form.items() if k.startswith('pref_')}
-        if pref_updates:
-            ws_p = wb['quiz_preferences']
-            keys_sent = set(pref_updates.keys())
-            rows_to_delete = [
-                r for r in range(ws_p.max_row, 1, -1)
-                if ws_p.cell(r, 2).value == customer_id and ws_p.cell(r, 4).value in keys_sent
-            ]
-            for r in rows_to_delete:
-                ws_p.delete_rows(r, 1)
-            for key, raw_values in pref_updates.items():
-                for v in [x.strip() for x in raw_values.split(',') if x.strip()]:
-                    new_row = _next_append_row(ws_p)
-                    ws_p.cell(new_row, 2).value = customer_id
-                    ws_p.cell(new_row, 3).value = customer_name
-                    ws_p.cell(new_row, 4).value = key
-                    ws_p.cell(new_row, 5).value = v
-            updated['preferences'] = pref_updates
+        updated = _apply_preference_updates(wb, customer_id, customer_name, request.form)
 
         if not updated:
             return jsonify({'error': 'No preference fields were sent.'}), 400
@@ -1622,7 +1729,27 @@ def dashboard_home_stats():
             key=lambda x: x['total_stock']
         )
 
-        return jsonify({'birthdays': birthdays, 'low_stock_categories': low_stock, 'low_stock_threshold': LOW_STOCK_THRESHOLD})
+        # New customers THIS real calendar month (not whichever month is
+        # loaded in the generate-month picker) -- so this surfaces the
+        # moment Iqra logs in, the same way she'd want to know about a
+        # fresh WhatsApp signup regardless of what month she's working on.
+        # Matched on subscribed_since, every status included (even one
+        # who already cancelled again fast is still worth her seeing).
+        this_month = _datetime.now().strftime('%Y-%m')
+        new_customers = sorted(
+            [
+                {'id': c['id'], 'name': c['name'], 'subscribed_since': c.get('subscribed_since'),
+                 'status': c.get('status')}
+                for c in customers.values()
+                if str(c.get('subscribed_since') or '').startswith(this_month)
+            ],
+            key=lambda c: c['subscribed_since'] or ''
+        )
+
+        return jsonify({
+            'birthdays': birthdays, 'low_stock_categories': low_stock, 'low_stock_threshold': LOW_STOCK_THRESHOLD,
+            'new_customers': new_customers,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1717,7 +1844,7 @@ def dashboard_inventory():
         inv = recommend_v5.load_inventory()
         show_all = request.args.get('all') == '1'
         items = [
-            {'name': p['name'], 'category': p['category'], 'tier': p['tier'],
+            {'id': p['id'], 'name': p['name'], 'category': p['category'], 'tier': p['tier'],
              'stock': p['stock'], 'price': p.get('retail_price_aed')}
             for p in inv if show_all or (p['stock'] or 0) > 0
         ]
@@ -1780,6 +1907,79 @@ def _apply_inventory_change(wb, ws, name, qty, category='', tier='', price_raw=N
         'name': name, 'old_stock': 0, 'new_stock': qty,
     }
 
+@app.route('/dashboard/edit_inventory_item', methods=['POST'])
+@dashboard_login_required
+def dashboard_edit_inventory_item():
+    """Lets Iqra correct an existing product directly -- fix a typo in its
+    name, move it to a different category/tier, or set its stock to an
+    EXACT number (unlike add_inventory/bulk_add_inventory, which only ever
+    ADD to whatever stock it already has -- this is for 'it's actually 14,
+    not however many that math landed on'). Only touches fields actually
+    sent, same guarantee as edit_customer -- a partial edit never wipes out
+    a field it wasn't given. Identified by product_id, not name, so
+    renaming a product doesn't break the lookup mid-request."""
+    product_id = (request.form.get('product_id') or '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required.'}), 400
+
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws = wb['inventory']
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        id_col = headers.index('product_id') + 1
+        n_col = headers.index('name') + 1
+        cat_col = headers.index('category') + 1
+        tier_col = headers.index('tier') + 1
+        s_col = headers.index('stock_qty') + 1
+        price_col = headers.index('retail_price_aed') + 1
+
+        target_row = None
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, id_col).value == product_id:
+                target_row = r
+                break
+        if not target_row:
+            return jsonify({'error': f'No product found with id "{product_id}".'}), 404
+
+        updated = {}
+        if 'name' in request.form:
+            new_name = request.form.get('name').strip()
+            if not new_name:
+                return jsonify({'error': 'name cannot be blank.'}), 400
+            ws.cell(target_row, n_col).value = new_name
+            updated['name'] = new_name
+        if 'category' in request.form:
+            ws.cell(target_row, cat_col).value = request.form.get('category').strip()
+            updated['category'] = request.form.get('category').strip()
+        if 'tier' in request.form:
+            ws.cell(target_row, tier_col).value = request.form.get('tier').strip()
+            updated['tier'] = request.form.get('tier').strip()
+        if 'stock' in request.form:
+            try:
+                new_stock = int(request.form.get('stock'))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'stock must be a whole number.'}), 400
+            if new_stock < 0:
+                return jsonify({'error': 'stock cannot be negative.'}), 400
+            ws.cell(target_row, s_col).value = new_stock
+            updated['stock'] = new_stock
+        if 'retail_price_aed' in request.form and request.form.get('retail_price_aed'):
+            try:
+                ws.cell(target_row, price_col).value = float(request.form.get('retail_price_aed'))
+                updated['retail_price_aed'] = request.form.get('retail_price_aed')
+            except ValueError:
+                pass
+
+        if not updated:
+            return jsonify({'error': 'No editable fields were sent.'}), 400
+
+        wb.save(recommend_v5.path)
+        push_to_github_async()
+        return jsonify({'success': True, 'product_id': product_id, 'updated': updated})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/dashboard/add_inventory', methods=['POST'])
 @dashboard_login_required
 def dashboard_add_inventory():
@@ -1814,17 +2014,89 @@ def dashboard_add_inventory():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# Matches a trailing "-1" / "-1 pc" / " — 2 pcs" / " – 3 pieces" style
+# quantity suffix at the END of a line -- Iqra's own raw-notes format. Uses
+# the LAST dash in the line as the separator (greedy .+ before the dash),
+# so a product name that itself contains a dash (e.g. "Huda Beauty Lip
+# Contour Stain – Trusty Brown — 1 pc") isn't broken on the wrong one.
+_BULK_QTY_SUFFIX_RE = re.compile(
+    r'^(?P<name>.+?)\s*[-–—]\s*(?P<qty>\d+)\s*(?:pc|pcs|piece|pieces)?\.?\s*$',
+    re.IGNORECASE
+)
+
+def _parse_bulk_inventory_line(line):
+    """Parses one pasted inventory line. Returns {'name','qty','category','tier'}
+    on a recognized product line, or None if the line isn't a product line at
+    all -- a category/section header like "Lips (Lip Contour Stains)" or
+    "BEAUTY PRODUCT" -- in which case the caller skips it silently instead of
+    treating it as an error. Raises ValueError (with a human-readable reason)
+    only when a line clearly IS attempting one of the formats below but is
+    malformed, e.g. "Some Product, abc".
+
+    Tries, in order:
+      1. Comma-separated: Name, Quantity[, Category, Tier]  (original format)
+      2. Tab-separated: Name<TAB>Quantity  (pasted straight from a spreadsheet)
+      3. Trailing quantity suffix: Name -1 / Name-1 / Name — 1 pc / Name – 2 pcs
+         (her raw-notes paste style)
+    """
+    if ',' in line:
+        parts = [p.strip() for p in line.split(',')]
+        if len(parts) >= 2 and parts[0]:
+            name, qty_raw = parts[0], parts[1]
+            try:
+                qty = int(qty_raw)
+            except ValueError:
+                raise ValueError(f'"{qty_raw}" is not a whole number.')
+            category = parts[2] if len(parts) > 2 else ''
+            tier = parts[3] if len(parts) > 3 else ''
+            return {'name': name, 'qty': qty, 'category': category, 'tier': tier}
+
+    if '\t' in line:
+        parts = [p.strip() for p in line.split('\t') if p.strip() != '']
+        if len(parts) >= 2:
+            try:
+                qty = int(parts[1])
+                category = parts[2] if len(parts) > 2 else ''
+                tier = parts[3] if len(parts) > 3 else ''
+                return {'name': parts[0], 'qty': qty, 'category': category, 'tier': tier}
+            except ValueError:
+                pass  # not actually a tab+number line -- fall through and try the dash-suffix pattern
+
+    m = _BULK_QTY_SUFFIX_RE.match(line)
+    if m:
+        name = m.group('name').strip()
+        if name:
+            return {'name': name, 'qty': int(m.group('qty')), 'category': '', 'tier': ''}
+
+    # Doesn't look like a product line at all -- most likely a category/
+    # section header such as "Lips (Lip Contour Stains)" or "BEAUTY PRODUCT".
+    return None
+
 @app.route('/dashboard/bulk_add_inventory', methods=['POST'])
 @dashboard_login_required
 def dashboard_bulk_add_inventory():
     """Lets Iqra paste in a whole restock list at once instead of adding
-    100 items one at a time. Expects a 'lines' form field, one product per
-    line, formatted as:  Name, Quantity[, Category, Tier]
-    (Category/Tier only matter for brand-new products; existing products
-    just get restocked by name match.) Blank lines and lines starting with
-    # are ignored. Every valid line is applied to the same in-memory
-    workbook, then it's saved and pushed to GitHub exactly once."""
+    items one at a time. Accepts several real-world paste formats so she
+    doesn't have to reformat anything by hand first -- see
+    _parse_bulk_inventory_line() for the exact formats. Lines that aren't
+    product lines at all (category/section headers like "Lips (Lip Contour
+    Stains)" or "BEAUTY PRODUCT") are silently skipped, not treated as
+    errors.
+
+    'tier' and 'category' form fields set the batch default for this whole
+    paste -- meant to be picked once from a dropdown/field above the paste
+    box (e.g. Tier=Prestige, Category=Lips) and applied to every brand-new
+    product in it. Existing products are only restocked and keep whatever
+    tier/category they already have -- the batch default never overwrites
+    that. A comma-format line can still specify its own category/tier,
+    which wins over the batch default for that one line.
+
+    Blank lines and lines starting with # are ignored. Every valid line is
+    applied to the same in-memory workbook, then it's saved and pushed to
+    GitHub exactly once."""
     raw = request.form.get('lines') or ''
+    default_tier = (request.form.get('tier') or '').strip()
+    default_category = (request.form.get('category') or '').strip()
     raw_lines = [ln.strip() for ln in raw.splitlines()]
 
     try:
@@ -1832,30 +2104,30 @@ def dashboard_bulk_add_inventory():
         wb = recommend_v5.wb
         ws = wb['inventory']
 
-        created, restocked, errors = [], [], []
+        created, restocked, errors, skipped = [], [], [], []
         any_applied = False
         for i, line in enumerate(raw_lines, start=1):
             if not line or line.startswith('#'):
                 continue
-            parts = [p.strip() for p in line.split(',')]
-            if len(parts) < 2:
-                errors.append({'line': i, 'text': line, 'reason': 'Expected "Name, Quantity" — no comma found.'})
+            try:
+                parsed = _parse_bulk_inventory_line(line)
+            except ValueError as e:
+                errors.append({'line': i, 'text': line, 'reason': str(e)})
                 continue
-            name = parts[0]
-            qty_raw = parts[1]
-            category = parts[2] if len(parts) > 2 else ''
-            tier = parts[3] if len(parts) > 3 else ''
+            if parsed is None:
+                skipped.append({'line': i, 'text': line})
+                continue
+
+            name = parsed['name']
+            qty = parsed['qty']
             if not name:
                 errors.append({'line': i, 'text': line, 'reason': 'Missing product name.'})
-                continue
-            try:
-                qty = int(qty_raw)
-            except ValueError:
-                errors.append({'line': i, 'text': line, 'reason': f'"{qty_raw}" is not a whole number.'})
                 continue
             if qty <= 0:
                 errors.append({'line': i, 'text': line, 'reason': 'Quantity must be greater than 0.'})
                 continue
+            category = parsed['category'] or default_category
+            tier = parsed['tier'] or default_tier
 
             result = _apply_inventory_change(wb, ws, name, qty, category, tier)
             any_applied = True
@@ -1873,9 +2145,11 @@ def dashboard_bulk_add_inventory():
             'created': created,
             'restocked': restocked,
             'errors': errors,
+            'skipped': skipped,
             'created_count': len(created),
             'restocked_count': len(restocked),
             'error_count': len(errors),
+            'skipped_count': len(skipped),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
