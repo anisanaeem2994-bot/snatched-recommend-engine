@@ -77,9 +77,28 @@ def load_customers():
             'box_type': row[6], 'cadence': row[7], 'city': row[8],
             'birthday': str(row[9]) if row[9] else '',
             'subscribed_since': str(row[10]) if row[10] else '',
+            'first_box_month': str(row[11]) if row[11] else '',
             'notes': row[14] or '',
+            'last_payment_confirmed': str(row[15]) if len(row) > 15 and row[15] else '',
         }
     return out
+
+# The cutoff day of the month: a customer signing up on or before this day
+# gets their first box the same month; signing up after it, they wait for
+# the following month. Keeping this as one named constant since it's quoted
+# directly to Iqra and may need to change later.
+FIRST_BOX_CUTOFF_DAY = 19
+
+def compute_first_box_month(as_of=None):
+    """Returns the 'YYYY-MM' a brand-new signup should get their first box,
+    per the cutoff rule above. as_of defaults to right now (today's real
+    date, or the test-clock date if one is active -- see _effective_now)."""
+    as_of = as_of or _effective_now()
+    if as_of.day <= FIRST_BOX_CUTOFF_DAY:
+        year, month = as_of.year, as_of.month
+    else:
+        year, month = (as_of.year, as_of.month + 1) if as_of.month < 12 else (as_of.year + 1, 1)
+    return f'{year:04d}-{month:02d}'
 
 def load_box_history():
     ws_b = wb['boxes']
@@ -285,6 +304,8 @@ def load_inventory():
             'cost_price': r[5] if len(r) > 5 else None,
             'retail_price_aed': r[6] if len(r) > 6 else None,
             'price_source': r[7] if len(r) > 7 else None,
+            'price_url': r[8] if len(r) > 8 else None,
+            'price_verified_date': str(r[9]) if len(r) > 9 and r[9] else None,
         })
     return inv
 
@@ -704,6 +725,9 @@ def is_customer_due(cust, box_timeline, target_month_str):
     history = box_timeline.get(cid, [])
 
     if not history:
+        first_box_month = str(cust.get('first_box_month', '')).strip()
+        if first_box_month and first_box_month > target_month_str:
+            return False, f"New customer — signed up after the {FIRST_BOX_CUTOFF_DAY}th, so their first box isn't due until {first_box_month}, not {target_month_str}."
         return True, "No prior box history — treat as due (first box)."
 
     last_month_str = history[-1][0]

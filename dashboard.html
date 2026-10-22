@@ -335,6 +335,7 @@
           <option value="Essentials">Essentials</option>
           <option value="Prestige">Prestige</option>
         </select>
+        <input id="addInvPrice" type="number" min="0" step="0.01" placeholder="Price AED (new products only)" title="Only used when creating a brand-new product. Without a price, it won't be eligible for any box — you can always fill this in later from Current Inventory." style="width:190px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
       </div>
       <div class="row-line" style="gap:8px;margin-top:8px;">
         <button class="btn btn-outline" onclick="stepInvQty(-1)" style="padding:6px 12px;">−</button>
@@ -346,18 +347,18 @@
 
       <div style="margin-top:16px;padding-top:14px;border-top:1px dashed var(--line);">
         <div style="font-size:13px;font-weight:700;margin-bottom:4px;">Got a whole restock list at once?</div>
-        <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Paste a list straight from your notes, a spreadsheet, or however you've got it — one product per line. Any of these line styles work: <code>Lip Gloss Pink, 12</code>, a line copied from a spreadsheet, or your own style like <code>Lip Gloss Pink -12</code>. Lines that are just a section header (like "Lips" or "BEAUTY PRODUCT") are skipped automatically. Doing one category at a time? Pick its Tier and Category below first — every <i>new</i> product in this paste gets tagged with them. Products that already exist just get restocked and keep what they already have.</div>
+        <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Paste your ENTIRE list in one go — you don't need to split it up by category. Keep your own section headers in there (like "Lips (Lip Contour Stains)" or just "Prestige" / "Essentials" as a divider) and the system reads them as you go — everything under a header gets tagged with it, until the next header changes it. A header it doesn't recognize (like a generic "BEAUTY PRODUCT" label) is just ignored, nothing breaks. Any of these line styles work: <code>Lip Gloss Pink, 12</code>, a line copied from a spreadsheet, or your own style like <code>Lip Gloss Pink -12</code>. Know the price already? Add it with AED/DHS instead of a plain number, like <code>Huda Beauty Lip Stain - Pink Blush -180 AED</code> — quantity defaults to 1 for that style (use the comma format with a 5th field, e.g. <code>Lip Gloss Pink, 3, Lips, Prestige, 95.50</code>, if you want both a quantity and a price on one line). If you'd rather do one category/tier at a time instead, the Tier and Category pickers below cover anything that never hits a header.</div>
         <div class="row-line" style="gap:8px;flex-wrap:wrap;margin-bottom:8px;">
-          <select id="bulkInvTier" title="Applies only to brand-new products in this paste. Every real product is Essentials or Prestige." style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
-            <option value="">Tier (new products only)</option>
+          <select id="bulkInvTier" title="Fallback only — used for any product that never hits a 'Prestige'/'Essentials' header in the paste itself." style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+            <option value="">Tier fallback (optional)</option>
             <option value="Essentials">Essentials</option>
             <option value="Prestige">Prestige</option>
           </select>
           <select id="bulkInvCategory" class="cat-select" style="padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
-            <option value="">Category (new products only)</option>
+            <option value="">Category fallback (optional)</option>
           </select>
         </div>
-        <textarea id="bulkInvLines" rows="5" placeholder="Lip Gloss Pink, 12&#10;Setting Powder -8&#10;Brand New Blush — 20 pcs" style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;font-family:inherit;resize:vertical;"></textarea>
+        <textarea id="bulkInvLines" rows="8" placeholder="Lips (Lip Contour Stains)&#10;Lip Gloss Pink, 12&#10;Setting Powder -8&#10;&#10;Prestige&#10;Brand New Blush — 20 pcs" style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;font-family:inherit;resize:vertical;"></textarea>
         <div class="row-line" style="gap:8px;margin-top:8px;">
           <button class="btn btn-approve" onclick="bulkAddInventory()">Upload list</button>
         </div>
@@ -716,7 +717,7 @@ async function ensureInventory(){
   const addInvCat = document.getElementById('addInvCategory');
   if(addInvCat) addInvCat.innerHTML = '<option value="">Category (new products only)</option>' + categoryOptionsHTML();
   const bulkInvCat = document.getElementById('bulkInvCategory');
-  if(bulkInvCat) bulkInvCat.innerHTML = '<option value="">Category (new products only)</option>' + categoryOptionsHTML();
+  if(bulkInvCat) bulkInvCat.innerHTML = '<option value="">Category fallback (optional)</option>' + categoryOptionsHTML();
   const nameList = document.getElementById('addInvNameList');
   if(nameList){
     nameList.innerHTML = inventoryCatalog.map(p=>`<option value="${(p.name||'').replace(/"/g,'&quot;')}"></option>`).join('');
@@ -787,18 +788,26 @@ async function addInventory(){
   const qty = parseInt(document.getElementById('addInvQty').value, 10) || 0;
   const category = document.getElementById('addInvCategory').value;
   const tier = document.getElementById('addInvTier').value;
+  const priceRaw = document.getElementById('addInvPrice').value;
   const resultEl = document.getElementById('addInvResult');
   if(!name){ alert('Type a product name first.'); return; }
   if(qty <= 0){ alert('Quantity must be at least 1.'); return; }
+  const payload = { name, quantity: qty, category, tier };
+  if(priceRaw !== ''){
+    const price = parseFloat(priceRaw);
+    if(isNaN(price) || price < 0){ alert('Price must be a number, 0 or more.'); return; }
+    payload.retail_price_aed = price;
+  }
   try{
-    const data = await postForm('/dashboard/add_inventory', { name, quantity: qty, category, tier });
+    const data = await postForm('/dashboard/add_inventory', payload);
     if(!data || data.error){ alert('Could not add inventory: ' + ((data && data.error) || 'unknown error')); return; }
     resultEl.style.display = 'block';
     resultEl.textContent = data.created_new
-      ? `Created new product "${data.name}" — now ${data.new_stock} in stock.`
+      ? `Created new product "${data.name}" — now ${data.new_stock} in stock.` + (payload.retail_price_aed ? '' : ' ⚠ No price set — it won\'t be picked for any box until you add one in Current Inventory.')
       : `"${data.name}" now has ${data.new_stock} in stock.`;
     document.getElementById('addInvName').value = '';
     document.getElementById('addInvQty').value = 1;
+    document.getElementById('addInvPrice').value = '';
     inventoryCatalog = null; // force a refresh so this shows up next time it's used
     ensureInventory();
     refreshInvView();
@@ -822,8 +831,21 @@ async function bulkAddInventory(){
     if(data.created.length){
       html += `<div style="margin-top:6px;font-size:11.5px;">New: ${data.created.map(r=>`${r.name} (${r.new_stock} in stock)`).join(', ')}</div>`;
     }
+    if(data.warnings && data.warnings.length){
+      html += `<div style="margin-top:8px;font-size:11.5px;color:var(--amber);">⚠ ${data.warnings.length} new product${data.warnings.length===1?'':'s'} need attention:<br>${data.warnings.map(w=>`Line ${w.line}: ${w.reason}`).join('<br>')}</div>`;
+    }
+    if(data.notices && data.notices.length){
+      html += `<div style="margin-top:8px;font-size:11.5px;color:var(--amber);">ℹ ${data.notices.length} possible mismatch${data.notices.length===1?'':'es'} — check these:<br>${data.notices.map(n=>`Line ${n.line}: ${n.reason}`).join('<br>')}</div>`;
+    }
     if(data.skipped && data.skipped.length){
-      html += `<div style="margin-top:8px;font-size:11.5px;color:var(--muted);">Skipped ${data.skipped.length} line${data.skipped.length===1?'':'s'} that looked like section headers, not products:<br>${data.skipped.map(s=>`Line ${s.line}: "${s.text}"`).join('<br>')}</div>`;
+      const markers = data.skipped.filter(s=>s.read_as);
+      const noise = data.skipped.filter(s=>!s.read_as);
+      if(markers.length){
+        html += `<div style="margin-top:8px;font-size:11.5px;color:var(--muted);">Read as section markers (applied to the lines below them):<br>${markers.map(s=>`Line ${s.line}: "${s.text}" → ${s.read_as}`).join('<br>')}</div>`;
+      }
+      if(noise.length){
+        html += `<div style="margin-top:8px;font-size:11.5px;color:var(--muted);">Skipped ${noise.length} line${noise.length===1?'':'s'} that didn't look like a product or a recognizable section header:<br>${noise.map(s=>`Line ${s.line}: "${s.text}"`).join('<br>')}</div>`;
+      }
     }
     if(data.errors.length){
       html += `<div style="margin-top:8px;font-size:11.5px;color:var(--red);">⚠ ${data.errors.length} line${data.errors.length===1?'':'s'} couldn't be read:<br>${data.errors.map(e=>`Line ${e.line}: "${e.text}" — ${e.reason}`).join('<br>')}</div>`;
@@ -856,14 +878,15 @@ function renderInvView(){
   if(!rows.length){ tableEl.innerHTML = '<div class="empty-note">No products match that search.</div>'; return; }
   tableEl.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12.5px;">
     <thead><tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--line);">
-      <th style="padding:6px 4px;">Product</th><th style="padding:6px 4px;">Category</th><th style="padding:6px 4px;">Tier</th><th style="padding:6px 4px;text-align:right;">Stock</th><th style="padding:6px 4px;"></th>
+      <th style="padding:6px 4px;">Product</th><th style="padding:6px 4px;">Category</th><th style="padding:6px 4px;">Tier</th><th style="padding:6px 4px;text-align:right;">Stock</th><th style="padding:6px 4px;text-align:right;">Price (AED)</th><th style="padding:6px 4px;"></th>
     </tr></thead>
     <tbody>${rows.map(p => `<tr style="border-bottom:1px solid var(--line);${(p.stock||0)===0?'color:var(--red);':''}">
       <td style="padding:6px 4px;">${p.name||''}</td>
       <td style="padding:6px 4px;">${p.category||''}</td>
       <td style="padding:6px 4px;">${p.tier||''}</td>
       <td style="padding:6px 4px;text-align:right;font-weight:700;">${p.stock||0}</td>
-      <td style="padding:6px 4px;text-align:right;">${p.id ? `<button class="btn-edit-toggle" onclick="openInventoryEdit('${jsAttrEscape(p.id)}')">✎ Edit</button>` : ''}</td>
+      <td style="padding:6px 4px;text-align:right;">${p.price ? `AED ${p.price}` : '<span style="color:var(--red);font-weight:700;">missing</span>'}</td>
+      <td style="padding:6px 4px;text-align:right;white-space:nowrap;">${p.id ? `<button class="btn-edit-toggle" onclick="openInventoryEdit('${jsAttrEscape(p.id)}')">✎ Edit</button> <button class="btn-edit-toggle" style="color:var(--red);" onclick="deleteInventoryItem('${jsAttrEscape(p.id)}','${jsAttrEscape(p.name||'')}',${p.stock||0})">🗑 Delete</button>` : ''}</td>
     </tr>`).join('')}</tbody>
   </table>`;
 }
@@ -884,7 +907,7 @@ function openInventoryEdit(productId){
         <h3 style="margin:0;">Edit "${p.name||''}"</h3>
         <button class="btn-edit-toggle" onclick="document.getElementById('invViewEditArea').innerHTML=''">✕ Close</button>
       </div>
-      <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;align-items:end;">
+      <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:8px;align-items:end;">
         <label style="font-size:12px;color:var(--muted);">Product name
           <input id="invEditName" value="${(p.name||'').replace(/"/g,'&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
         </label>
@@ -901,9 +924,15 @@ function openInventoryEdit(productId){
         <label style="font-size:12px;color:var(--muted);">Stock (exact)
           <input id="invEditStock" type="number" min="0" value="${p.stock||0}" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
         </label>
+        <label style="font-size:12px;color:var(--muted);">Price (AED)
+          <input id="invEditPrice" type="number" min="0" step="0.01" value="${p.price||''}" placeholder="e.g. 85" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
       </div>
-      <div style="font-size:11px;color:var(--muted);margin-top:6px;">Stock here REPLACES the current count — it's not added on top, unlike "Add inventory" and the bulk upload above.</div>
-      <div style="margin-top:10px;"><button class="btn btn-approve" onclick="saveInventoryEdit('${jsAttrEscape(productId)}')">Save changes</button></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px;">Stock here REPLACES the current count — it's not added on top, unlike "Add inventory" and the bulk upload above. A product with no price won't be picked for any customer's box, so this is the field that actually matters most for a brand-new product.</div>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-approve" onclick="saveInventoryEdit('${jsAttrEscape(productId)}')">Save changes</button>
+        <button class="btn btn-danger-outline" onclick="deleteInventoryItem('${jsAttrEscape(productId)}','${jsAttrEscape(p.name||'')}',${p.stock||0})">🗑 Delete this product</button>
+      </div>
     </div>
   `;
   document.getElementById('invEditName').focus();
@@ -914,17 +943,38 @@ async function saveInventoryEdit(productId){
   const category = document.getElementById('invEditCategory').value.trim();
   const tier = document.getElementById('invEditTier').value;
   const stockRaw = document.getElementById('invEditStock').value;
+  const priceRaw = document.getElementById('invEditPrice').value;
   if(!name){ alert('Product name cannot be blank.'); return; }
   const stock = parseInt(stockRaw, 10);
   if(isNaN(stock) || stock < 0){ alert('Stock must be a whole number, 0 or more.'); return; }
+  const payload = { product_id: productId, name, category, tier, stock };
+  if(priceRaw !== ''){
+    const price = parseFloat(priceRaw);
+    if(isNaN(price) || price < 0){ alert('Price must be a number, 0 or more.'); return; }
+    payload.retail_price_aed = price;
+  }
   try{
-    const data = await postForm('/dashboard/edit_inventory_item', { product_id: productId, name, category, tier, stock });
+    const data = await postForm('/dashboard/edit_inventory_item', payload);
     if(!data || data.error){ alert('Could not save: ' + ((data && data.error) || 'unknown error')); return; }
     document.getElementById('invViewEditArea').innerHTML = `<div class="empty-note" style="color:var(--green);font-weight:700;">✔ "${data.updated.name || name}" updated.</div>`;
     inventoryCatalog = null;
     ensureInventory();
     refreshInvView();
   }catch(e){ alert('Could not save: ' + e.message); }
+}
+
+async function deleteInventoryItem(productId, productName, currentStock){
+  const stockWarning = currentStock > 0 ? ` It currently shows ${currentStock} in stock.` : '';
+  if(!confirm(`Delete "${productName}" from inventory entirely?${stockWarning} This can't be undone from here — boxes already built with it in the past are unaffected, but it won't be pickable for any future box.`)) return;
+  try{
+    const data = await postForm('/dashboard/delete_inventory_item', { product_id: productId });
+    if(!data || data.error){ alert('Could not delete: ' + ((data && data.error) || 'unknown error')); return; }
+    const area = document.getElementById('invViewEditArea');
+    if(area) area.innerHTML = `<div class="empty-note" style="color:var(--green);font-weight:700;">✔ "${data.name || productName}" deleted.</div>`;
+    inventoryCatalog = null;
+    ensureInventory();
+    refreshInvView();
+  }catch(e){ alert('Could not delete: ' + e.message); }
 }
 
 async function doSwap(rowNumber){
@@ -1290,6 +1340,10 @@ async function renderProfileInto(targetId, name){
       <div class="row-line" style="margin-top:2px;">
         <span>Subscription status</span>
         <span class="pill ${String(data.status||'').toLowerCase()==='active' ? 'green' : (String(data.status||'').toLowerCase()==='paused' ? 'amber' : 'red')}">${data.status ? labelize(data.status) : 'Unknown'}</span>
+      </div>
+      <div class="row-line">
+        <span>Last payment confirmed</span>
+        <span class="pill ${data.last_payment_confirmed ? 'green' : 'amber'}">${data.last_payment_confirmed || 'No confirmation email yet'}</span>
       </div>
       <div style="margin:6px 0 16px;">
         ${(() => {

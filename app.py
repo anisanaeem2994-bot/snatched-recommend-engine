@@ -186,6 +186,13 @@ app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 # enough; nothing fancier is needed) ----
 app.secret_key = os.environ.get('DASHBOARD_SECRET_KEY', 'dev-only-change-me')
 DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD')
+
+# Separate from DASHBOARD_PASSWORD (which is for Iqra's own human login via the
+# browser session). This is a long random secret that Make.com sends back in a
+# request header on every call instead -- Make can't do a browser login, so it
+# needs its own always-valid credential. Set as a Render environment variable,
+# never committed to the repo or shown in the dashboard itself.
+MAKE_API_KEY = os.environ.get('MAKE_API_KEY')
 from datetime import timedelta as _timedelta, datetime as _datetime
 app.permanent_session_lifetime = _timedelta(days=30)
 
@@ -219,6 +226,30 @@ def dashboard_login_required(f):
     frontend needs to detect 'not logged in' programmatically."""
     @wraps(f)
     def wrapper(*args, **kwargs):
+        if not session.get('dashboard_authed'):
+            if request.method == 'GET' and request.accept_mimetypes.accept_html:
+                return redirect(url_for('dashboard_login_page'))
+            return jsonify({'error': 'Not logged in.'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+def dashboard_or_api_key_required(f):
+    """Like dashboard_login_required, but also accepts a request carrying a
+    valid 'X-Api-Key' header matching MAKE_API_KEY, as an alternative to
+    Iqra's own logged-in browser session. This is what lets Make.com call a
+    handful of dashboard endpoints (create_customer, edit_preferences) on its
+    own, without ever having Iqra's actual password -- Make sends this one
+    fixed key on every request instead of logging in.
+
+    If MAKE_API_KEY isn't set (no Render env var configured yet), the key
+    check is skipped entirely and this behaves exactly like
+    dashboard_login_required -- so leaving it unset never accidentally opens
+    the endpoint up to the public."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        supplied_key = request.headers.get('X-Api-Key')
+        if MAKE_API_KEY and supplied_key and supplied_key == MAKE_API_KEY:
+            return f(*args, **kwargs)
         if not session.get('dashboard_authed'):
             if request.method == 'GET' and request.accept_mimetypes.accept_html:
                 return redirect(url_for('dashboard_login_page'))
@@ -375,6 +406,7 @@ def customer_lookup_endpoint():
             'subscribed_since': cust.get('subscribed_since'),
             'birthday': cust.get('birthday'),
             'notes': cust.get('notes'),
+            'last_payment_confirmed': cust.get('last_payment_confirmed'),
             'boxes': customer_boxes[:8],
             'shade_notes': shade_notes,
             'blocked_brands': blocked_brands,
@@ -678,6 +710,12 @@ CUSTOMER_EDITABLE_FIELDS = {
     'name': 2, 'email': 3, 'phone': 4, 'payment_type': 6, 'box_type': 7,
     'billing_cadence': 8, 'city': 9, 'birthday': 10, 'subscribed_since': 11,
     'first_box_month': 12,
+    # Column 16 was unused (13/14 are 'upgraded_from'/'upgrade_date', 15 is
+    # 'notes'). Added so Make.com has somewhere to record a "Payment
+    # Confirmation" email -- see dashboard_confirm_payment() below. Not
+    # exposed through dashboard_edit_customer's normal form fields since
+    # Iqra never types this herself, only Make writes it.
+    'last_payment_confirmed': 16,
 }
 
 @app.route('/dashboard/edit_customer', methods=['POST'])
@@ -722,8 +760,59 @@ def dashboard_edit_customer():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/dashboard/confirm_payment', methods=['POST'])
+@dashboard_or_api_key_required
+def dashboard_confirm_payment():
+    """Make.com calls this (with the X-Api-Key header, using MAKE_API_KEY --
+    same mechanism as create_customer/edit_preferences) whenever Iqra's
+    Gmail gets an email labeled "Payment Confirmation". We're not building a
+    full payment ledger here -- just stamping the date of the most recent
+    confirmed payment against the matching customer, keyed off the email
+    address a confirmation email reliably contains (there's no Google Sheet
+    behind this anymore; everything lives in this same workbook the
+    dashboard already reads from). Matching is case-insensitive since the
+    email in the message body may not match the stored casing exactly."""
+    email = (request.form.get('email') or '').strip().lower()
+    if not email:
+        return jsonify({'error': 'email is required.'}), 400
+
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        email_col = CUSTOMER_EDITABLE_FIELDS['email']
+        payment_col = CUSTOMER_EDITABLE_FIELDS['last_payment_confirmed']
+        target_row = None
+        for row in ws_c.iter_rows(min_row=2):
+            cell_email = row[email_col - 1].value
+            if cell_email and str(cell_email).strip().lower() == email:
+                target_row = row
+                break
+        if not target_row:
+            return jsonify({'error': f'No customer found with email "{email}".'}), 404
+
+        # Self-healing: this column didn't exist until this endpoint was
+        # added, so make sure the header is there the first time anything
+        # actually writes to it.
+        header_cell = ws_c.cell(1, payment_col)
+        if not header_cell.value:
+            header_cell.value = 'last_payment_confirmed'
+
+        today_str = _datetime.now().strftime('%Y-%m-%d')
+        target_row[payment_col - 1].value = today_str
+
+        wb.save(recommend_v5.path)
+        push_to_github_async()
+        return jsonify({
+            'success': True,
+            'customer_id': target_row[0].value,
+            'last_payment_confirmed': today_str,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/dashboard/create_customer', methods=['POST'])
-@dashboard_login_required
+@dashboard_or_api_key_required
 def dashboard_create_customer():
     """Lets Iqra add a brand-new customer straight from the dashboard --
     for a WhatsApp signup or anything else that comes in outside the
@@ -767,6 +856,13 @@ def dashboard_create_customer():
                 ws_c.cell(new_row, col).value = request.form.get(field)
         if not request.form.get('subscribed_since'):
             ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['subscribed_since']).value = _datetime.now().strftime('%Y-%m-%d')
+        if not request.form.get('first_box_month'):
+            # Iqra's rule: signed up on/before the 19th of a month -> first box
+            # that same month; after the 19th -> first box the following
+            # month. Computed fresh here so a Make.com-created customer (or
+            # any manual add that doesn't specify it) always gets this right
+            # without anyone having to remember the cutoff by hand.
+            ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['first_box_month']).value = recommend_v5.compute_first_box_month()
 
         quiz_updated = _apply_preference_updates(wb, new_id, name, request.form)
 
@@ -859,7 +955,7 @@ def _apply_preference_updates(wb, customer_id, customer_name, form):
     return updated
 
 @app.route('/dashboard/edit_preferences', methods=['POST'])
-@dashboard_login_required
+@dashboard_or_api_key_required
 def dashboard_edit_preferences():
     """Lets Iqra correct a customer's quiz answers, category frequencies
     (Often/Sometimes/Rarely), and style preferences straight from the
@@ -1980,6 +2076,49 @@ def dashboard_edit_inventory_item():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/dashboard/delete_inventory_item', methods=['POST'])
+@dashboard_login_required
+def dashboard_delete_inventory_item():
+    """Removes one product from the inventory sheet entirely -- for a
+    discontinued product, a duplicate entered by mistake, or anything else
+    that shouldn't show up as pickable anymore. This only removes the
+    catalog row itself; it does NOT touch any box already generated or
+    committed with this product in it -- each box row keeps its own
+    snapshot of the product's name/category/tier/price from when it was
+    added (see _write_item_row), so past boxes stay exactly as they were.
+    The dashboard's own confirm() dialog is the only safety check here --
+    same as cancelling a customer or a box elsewhere in this file -- so a
+    mis-click can't delete the wrong product without her seeing which one
+    and confirming first."""
+    product_id = request.form.get('product_id')
+    if not product_id:
+        return jsonify({'error': 'product_id is required.'}), 400
+
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws = wb['inventory']
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        id_col = headers.index('product_id') + 1
+        n_col = headers.index('name') + 1
+
+        target_row = None
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, id_col).value == product_id:
+                target_row = r
+                break
+        if not target_row:
+            return jsonify({'error': f'No product found with id "{product_id}".'}), 404
+
+        deleted_name = ws.cell(target_row, n_col).value
+        ws.delete_rows(target_row, 1)
+
+        wb.save(recommend_v5.path)
+        push_to_github_async()
+        return jsonify({'success': True, 'product_id': product_id, 'name': deleted_name})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/dashboard/add_inventory', methods=['POST'])
 @dashboard_login_required
 def dashboard_add_inventory():
@@ -2024,20 +2163,37 @@ _BULK_QTY_SUFFIX_RE = re.compile(
     re.IGNORECASE
 )
 
+# Same idea, but for a trailing PRICE instead of a quantity -- e.g.
+# "Huda Beauty Lip Stain - Pink Blush -180 AED" or "...- 180 dhs". The
+# "aed"/"dhs"/"dirham(s)" word is what disambiguates this from the quantity
+# suffix above (a bare trailing number with no currency word is always read
+# as a quantity, never a price, to avoid guessing wrong). Quantity isn't
+# given in this style, so it defaults to 1 -- use the comma format below if
+# she wants to specify both a quantity AND a price on the same line.
+_BULK_PRICE_SUFFIX_RE = re.compile(
+    r'^(?P<name>.+?)\s*[-–—]\s*(?P<price>\d+(?:\.\d+)?)\s*(?:aed|dhs|dirhams?)\.?\s*$',
+    re.IGNORECASE
+)
+
 def _parse_bulk_inventory_line(line):
-    """Parses one pasted inventory line. Returns {'name','qty','category','tier'}
-    on a recognized product line, or None if the line isn't a product line at
-    all -- a category/section header like "Lips (Lip Contour Stains)" or
-    "BEAUTY PRODUCT" -- in which case the caller skips it silently instead of
-    treating it as an error. Raises ValueError (with a human-readable reason)
-    only when a line clearly IS attempting one of the formats below but is
-    malformed, e.g. "Some Product, abc".
+    """Parses one pasted inventory line. Returns
+    {'name','qty','category','tier','price'} on a recognized product line
+    ('price' is None when the line didn't specify one), or None if the line
+    isn't a product line at all -- a category/section header like "Lips
+    (Lip Contour Stains)" or "BEAUTY PRODUCT" -- in which case the caller
+    skips it silently instead of treating it as an error. Raises ValueError
+    (with a human-readable reason) only when a line clearly IS attempting
+    one of the formats below but is malformed, e.g. "Some Product, abc".
 
     Tries, in order:
-      1. Comma-separated: Name, Quantity[, Category, Tier]  (original format)
-      2. Tab-separated: Name<TAB>Quantity  (pasted straight from a spreadsheet)
-      3. Trailing quantity suffix: Name -1 / Name-1 / Name — 1 pc / Name – 2 pcs
-         (her raw-notes paste style)
+      1. Comma-separated: Name, Quantity[, Category, Tier[, Price]]
+         (original format, now with an optional 5th price field)
+      2. Tab-separated: Name<TAB>Quantity[<TAB>Category[<TAB>Tier[<TAB>Price]]]
+         (pasted straight from a spreadsheet)
+      3. Trailing price suffix: Name - 180 AED / Name -180 dhs
+         (price only, no quantity -- qty defaults to 1)
+      4. Trailing quantity suffix: Name -1 / Name-1 / Name — 1 pc / Name – 2 pcs
+         (her raw-notes paste style, no price)
     """
     if ',' in line:
         parts = [p.strip() for p in line.split(',')]
@@ -2049,7 +2205,13 @@ def _parse_bulk_inventory_line(line):
                 raise ValueError(f'"{qty_raw}" is not a whole number.')
             category = parts[2] if len(parts) > 2 else ''
             tier = parts[3] if len(parts) > 3 else ''
-            return {'name': name, 'qty': qty, 'category': category, 'tier': tier}
+            price = None
+            if len(parts) > 4 and parts[4]:
+                try:
+                    price = float(parts[4])
+                except ValueError:
+                    raise ValueError(f'"{parts[4]}" is not a valid price.')
+            return {'name': name, 'qty': qty, 'category': category, 'tier': tier, 'price': price}
 
     if '\t' in line:
         parts = [p.strip() for p in line.split('\t') if p.strip() != '']
@@ -2058,42 +2220,93 @@ def _parse_bulk_inventory_line(line):
                 qty = int(parts[1])
                 category = parts[2] if len(parts) > 2 else ''
                 tier = parts[3] if len(parts) > 3 else ''
-                return {'name': parts[0], 'qty': qty, 'category': category, 'tier': tier}
+                price = float(parts[4]) if len(parts) > 4 and parts[4] else None
+                return {'name': parts[0], 'qty': qty, 'category': category, 'tier': tier, 'price': price}
             except ValueError:
-                pass  # not actually a tab+number line -- fall through and try the dash-suffix pattern
+                pass  # not actually a tab+number line -- fall through and try the dash-suffix patterns
+
+    m = _BULK_PRICE_SUFFIX_RE.match(line)
+    if m:
+        name = m.group('name').strip()
+        if name:
+            return {'name': name, 'qty': 1, 'category': '', 'tier': '', 'price': float(m.group('price'))}
 
     m = _BULK_QTY_SUFFIX_RE.match(line)
     if m:
         name = m.group('name').strip()
         if name:
-            return {'name': name, 'qty': int(m.group('qty')), 'category': '', 'tier': ''}
+            return {'name': name, 'qty': int(m.group('qty')), 'category': '', 'tier': '', 'price': None}
 
     # Doesn't look like a product line at all -- most likely a category/
     # section header such as "Lips (Lip Contour Stains)" or "BEAUTY PRODUCT".
     return None
 
+def _match_known_category(header_text, known_categories):
+    """Given a pasted header/section line like 'Lips (Lip Contour Stains)'
+    or 'BEAUTY PRODUCT', tries to match it against category names already
+    used in the inventory sheet (case-insensitive substring match -- the
+    LONGEST known category that matches wins, so a more specific category
+    name is preferred over a shorter unrelated hit). Returns the EXISTING
+    category's exact stored spelling, so a new product lines up with it
+    instead of creating a near-duplicate differently-cased category.
+    Returns None if nothing matches -- e.g. 'BEAUTY PRODUCT' is just a
+    generic spreadsheet column label, not a real category, so it's
+    correctly left alone rather than becoming a junk category."""
+    text_lower = header_text.lower()
+    best = None
+    for cat in known_categories:
+        if cat and cat.lower() in text_lower:
+            if best is None or len(cat) > len(best):
+                best = cat
+    return best
+
 @app.route('/dashboard/bulk_add_inventory', methods=['POST'])
 @dashboard_login_required
 def dashboard_bulk_add_inventory():
-    """Lets Iqra paste in a whole restock list at once instead of adding
-    items one at a time. Accepts several real-world paste formats so she
-    doesn't have to reformat anything by hand first -- see
-    _parse_bulk_inventory_line() for the exact formats. Lines that aren't
-    product lines at all (category/section headers like "Lips (Lip Contour
-    Stains)" or "BEAUTY PRODUCT") are silently skipped, not treated as
-    errors.
+    """Lets Iqra paste her ENTIRE inventory list in one go -- every
+    category, mixed together -- instead of having to split it up and
+    upload one category at a time. Accepts several real-world paste
+    formats so she doesn't have to reformat anything by hand first -- see
+    _parse_bulk_inventory_line() for the exact product-line formats.
 
-    'tier' and 'category' form fields set the batch default for this whole
-    paste -- meant to be picked once from a dropdown/field above the paste
-    box (e.g. Tier=Prestige, Category=Lips) and applied to every brand-new
-    product in it. Existing products are only restocked and keep whatever
-    tier/category they already have -- the batch default never overwrites
-    that. A comma-format line can still specify its own category/tier,
-    which wins over the batch default for that one line.
+    The key piece that makes 'paste everything at once' actually work:
+    a line that ISN'T a product line (no comma/tab/trailing-quantity --
+    e.g. her own section headers like 'Lips (Lip Contour Stains)' or a
+    plain 'PRESTIGE' / 'ESSENTIALS' divider) is read as a section marker
+    instead of being thrown away. It's matched against category names
+    that already exist in the inventory sheet (see _match_known_category),
+    or against the words 'prestige'/'essentials' for tier, and from that
+    point on every following product line is tagged with whatever
+    category/tier that marker set -- until the next marker changes it.
+    A header that doesn't match anything recognizable (like 'BEAUTY
+    PRODUCT', which is just a spreadsheet column label) is left alone and
+    doesn't change what's currently set, so it can't accidentally create a
+    junk category.
+
+    The 'tier' and 'category' form fields are the fallback for the parts
+    of the paste that never hit a marker at all (e.g. she skips headers
+    entirely and picks a Tier/Category from the dropdowns once for the
+    whole paste, same as before) -- a recognized inline marker always
+    wins over these once it's been seen. A comma-format line can still
+    specify its own category/tier, which wins over everything else for
+    that one line.
+
+    Existing products are only ever restocked and keep whatever
+    tier/category they ALREADY have on file -- nothing here ever
+    overwrites that. If what this paste resolved for a line doesn't match
+    what's already stored (e.g. she expected it under 'Lips' but it was
+    filed under 'Lip Products'), that's surfaced as a notice, not an
+    error, so a real mismatch or a duplicate-under-a-different-name is
+    visible instead of silently restocking the wrong-seeming product.
+    Any brand-new product created with no tier at all (no marker, no
+    default, no comma-format tier) is flagged as a warning, since tier is
+    what actually controls which box pool a product can be picked for --
+    easy to fix afterwards with the Edit button in Current Inventory.
 
     Blank lines and lines starting with # are ignored. Every valid line is
     applied to the same in-memory workbook, then it's saved and pushed to
-    GitHub exactly once."""
+    GitHub exactly once -- nothing is partially saved if something later
+    in the paste has a problem."""
     raw = request.form.get('lines') or ''
     default_tier = (request.form.get('tier') or '').strip()
     default_category = (request.form.get('category') or '').strip()
@@ -2103,9 +2316,17 @@ def dashboard_bulk_add_inventory():
         _reload_if_needed()
         wb = recommend_v5.wb
         ws = wb['inventory']
+        inv_snapshot = recommend_v5.load_inventory()
+        known_categories = sorted({p['category'] for p in inv_snapshot if p.get('category')})
+        inv_by_name_lower = {
+            (p.get('name') or '').strip().lower(): {'category': p.get('category'), 'tier': p.get('tier')}
+            for p in inv_snapshot if p.get('name')
+        }
 
-        created, restocked, errors, skipped = [], [], [], []
+        created, restocked, errors, skipped, notices, warnings = [], [], [], [], [], []
         any_applied = False
+        current_category = ''
+        current_tier = ''
         for i, line in enumerate(raw_lines, start=1):
             if not line or line.startswith('#'):
                 continue
@@ -2115,7 +2336,29 @@ def dashboard_bulk_add_inventory():
                 errors.append({'line': i, 'text': line, 'reason': str(e)})
                 continue
             if parsed is None:
-                skipped.append({'line': i, 'text': line})
+                # Not a product line -- see if it's actually a section
+                # marker (category or tier) instead of just noise.
+                lower = line.lower()
+                if 'prestige' in lower:
+                    current_tier = 'Prestige'
+                    skipped.append({'line': i, 'text': line, 'read_as': 'Tier marker: Prestige'})
+                elif 'essentials' in lower:
+                    current_tier = 'Essentials'
+                    skipped.append({'line': i, 'text': line, 'read_as': 'Tier marker: Essentials'})
+                else:
+                    match = _match_known_category(line, known_categories)
+                    if match:
+                        current_category = match
+                        skipped.append({'line': i, 'text': line, 'read_as': f'Category marker: {match}'})
+                    else:
+                        # An unrecognized header still marks a section
+                        # boundary -- clear current_category rather than
+                        # silently carrying the PREVIOUS category's new
+                        # products into this unrelated section. Tier is
+                        # left alone since a tier section (e.g. "Prestige")
+                        # usually spans several category headers under it.
+                        current_category = ''
+                        skipped.append({'line': i, 'text': line, 'read_as': None})
                 continue
 
             name = parsed['name']
@@ -2126,13 +2369,61 @@ def dashboard_bulk_add_inventory():
             if qty <= 0:
                 errors.append({'line': i, 'text': line, 'reason': 'Quantity must be greater than 0.'})
                 continue
-            category = parsed['category'] or default_category
-            tier = parsed['tier'] or default_tier
+            category = parsed['category'] or current_category or default_category
+            tier = parsed['tier'] or current_tier or default_tier
 
-            result = _apply_inventory_change(wb, ws, name, qty, category, tier)
+            # Check BEFORE applying whether this is a restock of something
+            # that already has a different category/tier on file, so a
+            # real mismatch (or two differently-named products colliding)
+            # is visible instead of silently restocking under the surprise.
+            # inv_by_name_lower is kept up to date as the loop goes, so a
+            # product created earlier IN THIS SAME PASTE is also caught
+            # correctly if a later line restocks it under a different tag.
+            existing = inv_by_name_lower.get(name.strip().lower())
+            if existing and (
+                (category and existing.get('category') and category.strip().lower() != str(existing['category']).strip().lower())
+                or (tier and existing.get('tier') and tier.strip().lower() != str(existing['tier']).strip().lower())
+            ):
+                notices.append({
+                    'line': i, 'text': line,
+                    'reason': f'"{name}" is already on file as {existing.get("category") or "—"} / {existing.get("tier") or "—"} '
+                              f'— this paste suggested {category or "—"} / {tier or "—"}. Restocked under its EXISTING category/tier, nothing changed.'
+                })
+
+            price = parsed.get('price')
+            result = _apply_inventory_change(wb, ws, name, qty, category, tier, price)
             any_applied = True
             if result['created_new']:
                 created.append(result)
+                inv_by_name_lower[name.strip().lower()] = {'category': category, 'tier': tier}
+                missing = []
+                if not tier:
+                    missing.append('tier')
+                if not category:
+                    missing.append('category')
+                if missing:
+                    warnings.append({
+                        'line': i, 'text': line,
+                        'reason': f'"{name}" was created with no {" or ".join(missing)} set — '
+                                  + ('it won\'t be eligible for any box until you set a tier' if 'tier' in missing else 'fix it')
+                                  + ' (use Edit in Current Inventory).'
+                    })
+                # A price given inline on the line itself (see
+                # _parse_bulk_inventory_line -- the "- 180 AED" suffix, or a
+                # comma/tab format's optional 5th field) is already applied
+                # by _apply_inventory_change above, so only warn when one
+                # genuinely wasn't given. Without a price,
+                # optimize_box_value() silently skips the product entirely
+                # when building boxes (it's excluded from candidates, not
+                # just under-weighted) -- so this warning exists to make
+                # sure that never happens invisibly.
+                if price is None:
+                    warnings.append({
+                        'line': i, 'text': line,
+                        'reason': f'"{name}" has no retail price yet — it will NOT be picked for any '
+                                  f'customer\'s box until you look up its price and set it '
+                                  f'(use Edit in Current Inventory).'
+                })
             else:
                 restocked.append(result)
 
@@ -2146,6 +2437,8 @@ def dashboard_bulk_add_inventory():
             'restocked': restocked,
             'errors': errors,
             'skipped': skipped,
+            'notices': notices,
+            'warnings': warnings,
             'created_count': len(created),
             'restocked_count': len(restocked),
             'error_count': len(errors),
