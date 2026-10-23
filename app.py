@@ -887,51 +887,65 @@ def dashboard_create_customer():
     Only 'name' is required. Status defaults to Active unless told
     otherwise. subscribed_since defaults to today if not given, since a
     brand-new signup is, by definition, subscribing as of right now."""
-    name = (request.form.get('name') or '').strip()
-    if not name:
-        return jsonify({'error': 'name is required.'}), 400
-
     try:
-        _reload_if_needed()
-        wb = recommend_v5.wb
-        ws_c = wb['customers']
-
-        # Next CUSTOMER_ID, continuing the existing 'C0XX' numbering.
-        max_num = 0
-        for row in ws_c.iter_rows(min_row=2, values_only=True):
-            cid = row[0]
-            if cid:
-                digits = ''.join(ch for ch in str(cid) if ch.isdigit())
-                if digits:
-                    max_num = max(max_num, int(digits))
-        new_id = f'C{max_num + 1:03d}'
-
-        new_row = _next_append_row(ws_c, check_cols=(1, 2))
-        ws_c.cell(new_row, 1).value = new_id
-        ws_c.cell(new_row, 2).value = name
-        ws_c.cell(new_row, 5).value = request.form.get('status') or 'Active'
-        for field, col in CUSTOMER_EDITABLE_FIELDS.items():
-            if field == 'name':
-                continue  # already set above
-            if field in request.form and request.form.get(field):
-                ws_c.cell(new_row, col).value = request.form.get(field)
-        if not request.form.get('subscribed_since'):
-            ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['subscribed_since']).value = _datetime.now().strftime('%Y-%m-%d')
-        if not request.form.get('first_box_month'):
-            # Iqra's rule: signed up on/before the 19th of a month -> first box
-            # that same month; after the 19th -> first box the following
-            # month. Computed fresh here so a Make.com-created customer (or
-            # any manual add that doesn't specify it) always gets this right
-            # without anyone having to remember the cutoff by hand.
-            ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['first_box_month']).value = recommend_v5.compute_first_box_month()
-
-        quiz_updated = _apply_preference_updates(wb, new_id, name, request.form)
-
-        wb.save(recommend_v5.path)
-        push_to_github_async()
+        new_id, name, quiz_updated = _create_customer_core(request.form)
         return jsonify({'success': True, 'customer_id': new_id, 'name': name, 'quiz_updated': quiz_updated})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+def _create_customer_core(form):
+    """Shared core of dashboard_create_customer() and
+    dashboard_quiz_submission() -- generates the next CUSTOMER_ID,
+    writes the new row, and fills in any quiz/frequency/preference
+    fields present, via _apply_preference_updates. `form` is anything
+    dict-like with .get()/.items()/'in' support -- a real request.form,
+    or a plain dict built from a parsed quiz email. Raises
+    ValueError('name is required.') if name is missing. Returns
+    (new_id, name, quiz_updated)."""
+    name = (form.get('name') or '').strip()
+    if not name:
+        raise ValueError('name is required.')
+
+    _reload_if_needed()
+    wb = recommend_v5.wb
+    ws_c = wb['customers']
+
+    # Next CUSTOMER_ID, continuing the existing 'C0XX' numbering.
+    max_num = 0
+    for row in ws_c.iter_rows(min_row=2, values_only=True):
+        cid = row[0]
+        if cid:
+            digits = ''.join(ch for ch in str(cid) if ch.isdigit())
+            if digits:
+                max_num = max(max_num, int(digits))
+    new_id = f'C{max_num + 1:03d}'
+
+    new_row = _next_append_row(ws_c, check_cols=(1, 2))
+    ws_c.cell(new_row, 1).value = new_id
+    ws_c.cell(new_row, 2).value = name
+    ws_c.cell(new_row, 5).value = form.get('status') or 'Active'
+    for field, col in CUSTOMER_EDITABLE_FIELDS.items():
+        if field == 'name':
+            continue  # already set above
+        if field in form and form.get(field):
+            ws_c.cell(new_row, col).value = form.get(field)
+    if not form.get('subscribed_since'):
+        ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['subscribed_since']).value = _datetime.now().strftime('%Y-%m-%d')
+    if not form.get('first_box_month'):
+        # Iqra's rule: signed up on/before the 19th of a month -> first box
+        # that same month; after the 19th -> first box the following
+        # month. Computed fresh here so a Make.com-created customer (or
+        # any manual add that doesn't specify it) always gets this right
+        # without anyone having to remember the cutoff by hand.
+        ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['first_box_month']).value = recommend_v5.compute_first_box_month()
+
+    quiz_updated = _apply_preference_updates(wb, new_id, name, form)
+
+    wb.save(recommend_v5.path)
+    push_to_github_async()
+    return new_id, name, quiz_updated
 
 def _apply_preference_updates(wb, customer_id, customer_name, form):
     """Shared core of dashboard_edit_preferences() -- writes quiz answers,
@@ -1014,6 +1028,229 @@ def _apply_preference_updates(wb, customer_id, customer_name, form):
         updated['preferences'] = pref_updates
 
     return updated
+
+# ---------------------------------------------------------------------
+# Quiz-submission email parsing (New Quiz Submission Make.com scenario)
+# ---------------------------------------------------------------------
+# Confirmed against a real submission (2026-10-14, no-reply@snatchedbox.com,
+# subject "Snatchedbox User Quiz") pulled straight from that scenario's
+# execution history. Full text body looks like:
+#
+#   Beauty Quiz
+#   Beauty Quiz
+#   User Email:beth_robins@hotmail.co.uk
+#   Name:Beth Robins
+#   Phone:585267539
+#   Q: What is your skin tone? *
+#   A: Fair
+#   Q: How would you describe your skin concerns? (Select all that apply) *
+#   A: Oiliness and large pores
+#   Q: How often do you want the following skincare products?
+#   A: Cleanser/Face wash *: Sometimes
+#   A: Eye treatment *: Rarely
+#   ...
+#   Q: What shades would you prefer if you received these products? (Select all that apply)
+#   A: Eye Shadows *: Neutrals
+#   A: Blush *: Pinks
+#   ...
+#
+# Two answer shapes: a plain "A: <value>" (possibly several in a row for a
+# multi-select question) that belongs to whatever "Q:" came before it, and
+# a sub-labeled "A: <Label> *: <value>" used for both the "how often"
+# frequency questions AND the "what shades" preference question. The same
+# label ("Blush") is reused between those two questions, so which one a
+# sub-labeled answer belongs to is decided by the VALUE, not the label:
+# Often/Sometimes/Rarely is always a frequency, anything else is a shade/
+# style pick. That sidesteps the ambiguity entirely.
+
+QUIZ_FREQ_LABEL_MAP = {
+    'cleanser/face wash': 'cleanser',
+    'eye treatment': 'eye_treatment',
+    'serum/moisturizer': 'serum_moisturizer',
+    'sheet masks': 'sheet_masks',
+    'primer': 'primer',
+    'concealer': 'concealer',
+    'foundation': 'foundation',
+    'makeup tools': 'makeup_tools',
+    'powder': 'powder',
+    'blush': 'blush',
+    'bronzer/contour': 'bronzer_contour',
+    'highlighter': 'highlighter',
+    'mascara': 'mascara',
+    'brows': 'brows',
+    'eyeshadow': 'eyeshadow',
+    'eye liner': 'eyeliner',
+    'lipstick': 'lipstick',
+    'liquid lipstick': 'liquid_lipstick',
+    'lip gloss': 'lip_gloss',
+    'lip liner': 'lip_liner',
+}
+QUIZ_SHADE_LABEL_MAP = {
+    'eye shadows': 'eyeshadow_color',
+    'lips': 'lips_color',
+    'blush': 'blush_color',
+    'nail polish': 'nail_color',
+}
+QUIZ_FREQ_VALUES = {'often', 'sometimes', 'rarely'}
+
+# Plain "Q: ... A: <value>" questions -- matched by keyword against the
+# question text, in this order (most specific first, since e.g. "hair"
+# appears in two different questions).
+QUIZ_PLAIN_Q_PATTERNS = [
+    (re.compile(r'skin tone', re.I), ('quiz', 'skin_tone')),
+    (re.compile(r'skin concern', re.I), ('pref', 'skin_concerns')),
+    (re.compile(r'color are your eyes|eye colou?r', re.I), ('quiz', 'eye_color')),
+    (re.compile(r'describe your hair', re.I), ('pref', 'hair_concerns')),
+    (re.compile(r'color is your hair|hair colou?r', re.I), ('quiz', 'hair_color')),
+    (re.compile(r'comfortable are you with makeup', re.I), ('quiz', 'makeup_comfort')),
+    (re.compile(r'scents? do you prefer', re.I), ('pref', 'scent_preference')),
+    (re.compile(r'where do you shop', re.I), ('pref', 'shopping_habits')),
+]
+
+_QUIZ_SUBLABEL_RE = re.compile(r'^(?P<label>.+?)\s*\*\s*:\s*(?P<value>.+?)\.?$')
+
+
+def parse_quiz_email(text):
+    """Parses a 'Snatchedbox User Quiz' email's full text body into fields
+    ready for _create_customer_core()/_apply_preference_updates(): name,
+    email, phone, skin_tone, eye_color, hair_color, makeup_comfort, plus
+    freq_<category> and pref_<key> entries for every question she actually
+    answered. Unrecognized lines (header boilerplate, a sub-label that
+    doesn't match a known question) are skipped rather than guessed at, so
+    a quiz format tweak degrades gracefully instead of corrupting data."""
+    out = {'name': '', 'email': '', 'phone': '',
+           'skin_tone': '', 'eye_color': '', 'hair_color': '', 'makeup_comfort': ''}
+    freqs = {}
+    prefs = {}
+    current_bucket = None  # (kind, key) for the plain-answer question we're inside
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = re.match(r'^User\s*Email\s*:\s*(.+)$', line, re.I)
+        if m:
+            out['email'] = m.group(1).strip()
+            continue
+        m = re.match(r'^Name\s*:\s*(.+)$', line, re.I)
+        if m:
+            out['name'] = m.group(1).strip()
+            continue
+        m = re.match(r'^Phone\s*:\s*(.+)$', line, re.I)
+        if m:
+            out['phone'] = m.group(1).strip()
+            continue
+
+        if line.startswith('Q:'):
+            q_text = line[2:]
+            current_bucket = None
+            for pattern, bucket in QUIZ_PLAIN_Q_PATTERNS:
+                if pattern.search(q_text):
+                    current_bucket = bucket
+                    break
+            continue
+
+        if line.startswith('A:'):
+            a_text = line[2:].strip()
+            sub = _QUIZ_SUBLABEL_RE.match(a_text)
+            if sub:
+                label = sub.group('label').strip().lower()
+                value = sub.group('value').strip()
+                if value.lower() in QUIZ_FREQ_VALUES and label in QUIZ_FREQ_LABEL_MAP:
+                    freqs[QUIZ_FREQ_LABEL_MAP[label]] = value
+                elif label in QUIZ_SHADE_LABEL_MAP:
+                    prefs.setdefault(QUIZ_SHADE_LABEL_MAP[label], []).append(value)
+                # else: a sub-label we don't recognize -- skip it rather
+                # than risk filing it under the wrong field.
+                continue
+            if current_bucket:
+                kind, key = current_bucket
+                if kind == 'quiz':
+                    out[key] = a_text
+                else:
+                    prefs.setdefault(key, []).append(a_text)
+            continue
+
+    for cat, level in freqs.items():
+        out['freq_' + cat] = level
+    for key, values in prefs.items():
+        out['pref_' + key] = ', '.join(values)
+    return out
+
+
+@app.route('/dashboard/quiz_submission', methods=['POST'])
+@dashboard_or_api_key_required
+def dashboard_quiz_submission():
+    """Make.com's 'New Quiz Submission' scenario calls this (X-Api-Key:
+    MAKE_API_KEY) with the FULL raw text body of a 'Snatchedbox User Quiz'
+    email in the 'email_text' form field -- all the actual parsing happens
+    here in Python (see parse_quiz_email above) instead of a long, fragile
+    chain of Make.com Text Parser modules.
+
+    Creates the customer with her name/email/phone, quiz basics, every
+    category frequency she answered, and every style/shopping preference
+    she answered -- the same thing 'Add new customer' on the dashboard
+    does by hand, done automatically. If a customer with this email
+    already exists (a resubmission, or she signed up another way first),
+    her quiz/preference answers are updated on that existing record
+    instead of creating a duplicate; her name/phone are only filled in if
+    she didn't already have one on file, so this never clobbers something
+    Iqra already corrected by hand."""
+    raw_text = request.form.get('email_text') or request.form.get('full_text_body') or ''
+    if not raw_text.strip():
+        return jsonify({'error': "email_text is required (the quiz email's full text body)."}), 400
+
+    try:
+        parsed = parse_quiz_email(raw_text)
+    except Exception as e:
+        return jsonify({'error': f'Could not parse quiz email: {e}'}), 400
+
+    if not parsed.get('name'):
+        return jsonify({'error': 'Could not find a "Name:" line in the quiz email.'}), 422
+    if not parsed.get('email'):
+        return jsonify({'error': 'Could not find a "User Email:" line in the quiz email.'}), 422
+
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        email_col = CUSTOMER_EDITABLE_FIELDS['email']
+        name_col = CUSTOMER_EDITABLE_FIELDS['name']
+        phone_col = CUSTOMER_EDITABLE_FIELDS['phone']
+        email_lower = parsed['email'].strip().lower()
+
+        existing_row = None
+        for row in ws_c.iter_rows(min_row=2):
+            cell_email = row[email_col - 1].value
+            if cell_email and str(cell_email).strip().lower() == email_lower:
+                existing_row = row
+                break
+
+        if existing_row is not None:
+            customer_id = existing_row[0].value
+            name = existing_row[name_col - 1].value or parsed['name']
+            if not existing_row[name_col - 1].value:
+                existing_row[name_col - 1].value = parsed['name']
+            if parsed.get('phone') and not existing_row[phone_col - 1].value:
+                existing_row[phone_col - 1].value = parsed['phone']
+            quiz_updated = _apply_preference_updates(wb, customer_id, name, parsed)
+            wb.save(recommend_v5.path)
+            push_to_github_async()
+            return jsonify({
+                'success': True, 'created': False, 'customer_id': customer_id,
+                'name': name, 'quiz_updated': quiz_updated,
+            })
+
+        new_id, name, quiz_updated = _create_customer_core(parsed)
+        return jsonify({
+            'success': True, 'created': True, 'customer_id': new_id,
+            'name': name, 'quiz_updated': quiz_updated,
+        })
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/dashboard/edit_preferences', methods=['POST'])
 @dashboard_or_api_key_required
