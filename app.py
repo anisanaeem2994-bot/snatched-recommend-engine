@@ -520,6 +520,67 @@ def dashboard_set_customer_status():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/dashboard/resync_board', methods=['POST'])
+@dashboard_login_required
+def dashboard_resync_board():
+    """Re-checks every customer currently sitting on the open (not yet
+    committed) month's board against her CURRENT status in the customers
+    sheet, and removes anyone who's since been Paused or Cancelled through
+    some route other than clicking Pause/Cancel on her own profile (e.g.
+    edited directly in the sheet, or via Make) -- so a board that was
+    generated a while ago can't quietly go stale before it's committed.
+    This is exactly the same cleanup /dashboard/set_customer_status already
+    does for one customer the moment she's paused/cancelled on her profile
+    -- this just sweeps the whole board in one go, for anyone who slipped
+    through because her status changed somewhere else.
+
+    Restocks any already-Approved items for anyone removed (stock was
+    already taken for those). Does NOT touch anyone still active, does NOT
+    re-pick or re-score anyone's items, and does NOT add anyone newly due
+    who wasn't on the board to begin with -- for that, use 'Generate her
+    box for a month' from her own profile instead."""
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws_board = _get_dash_sheet(create=False)
+        if ws_board is None:
+            return jsonify({'success': True, 'removed': [], 'removed_count': 0, 'remaining_count': 0,
+                             'message': 'No board is currently open — generate this month first.'})
+
+        customers = recommend_v5.load_customers()
+        blocks = _parse_dash_sheet(ws_board)
+
+        removed = []
+        rows_to_delete = []
+        for b in blocks:
+            cust = customers.get(b['customer_id'])
+            status = str((cust or {}).get('status', '')).strip().lower()
+            if cust is not None and status not in ('cancelled', 'paused'):
+                continue  # still active (or blank/other -- same "active" definition used everywhere else)
+            restocked = 0
+            for it in b['items']:
+                if it['status'] == 'Approved' and it['name']:
+                    if _restock_product_by_name(wb, it['name']):
+                        restocked += 1
+            removed.append({
+                'customer_id': b['customer_id'], 'customer_name': b['customer_name'],
+                'status': (cust or {}).get('status') or 'not found', 'restocked_count': restocked,
+            })
+            rows_to_delete += [b['header_row']] + [i['row_number'] for i in b['items']]
+
+        if rows_to_delete:
+            for r in sorted(set(rows_to_delete), reverse=True):
+                ws_board.delete_rows(r, 1)
+            wb.save(recommend_v5.path)
+            push_to_github_async()
+
+        return jsonify({
+            'success': True, 'removed': removed, 'removed_count': len(removed),
+            'remaining_count': len(blocks) - len(removed),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/dashboard/cancel_box', methods=['POST'])
 @dashboard_login_required
 def dashboard_cancel_box():

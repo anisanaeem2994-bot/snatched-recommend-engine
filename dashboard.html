@@ -388,6 +388,13 @@
         <button class="btn btn-swap" onclick="viewPastMonth()">View</button>
       </div>
       <div id="pastMonthResult" style="margin-top:10px;"></div>
+      <div id="pamphletArea" style="display:none;margin-top:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
+          <span style="font-size:11.5px;color:var(--muted);">Personalized pamphlet text for this month — one block per customer, cancelled boxes left out. Select all and copy, or use the button.</span>
+          <button class="btn-edit-toggle" id="pamphletCopyBtn" onclick="copyPamphletText()">📋 Copy to clipboard</button>
+        </div>
+        <textarea id="pamphletTextArea" readonly rows="12" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:12.5px;font-family:monospace;white-space:pre-wrap;" onclick="this.select()"></textarea>
+      </div>
     </div>
 
     <div class="panel">
@@ -409,6 +416,9 @@
         <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
       </div>
       <button class="commit-btn" id="commitBtn" onclick="tryCommit()">Commit Month →</button>
+    </div>
+    <div class="row-line" style="margin:-4px 0 10px;justify-content:flex-end;">
+      <button class="btn btn-undo" onclick="resyncBoard()" title="Re-checks everyone on this board against their current status and removes anyone paused/cancelled since it was generated">🔄 Resync board (recheck who's still active)</button>
     </div>
 
     <div id="custList"></div>
@@ -745,12 +755,17 @@ async function loadPastMonths(){
   }
 }
 
+let lastPastMonthData = null;  // cached so Copy pamphlet text doesn't need to re-fetch
+
 async function viewPastMonth(){
   const sel = document.getElementById('pastMonthSelect');
   const resultEl = document.getElementById('pastMonthResult');
+  const pamphletArea = document.getElementById('pamphletArea');
   const month = sel.value;
   if(!month){ return; }
   resultEl.innerHTML = `<div class="empty-note">Loading…</div>`;
+  pamphletArea.style.display = 'none';
+  lastPastMonthData = null;
   try{
     const data = await api('/dashboard/month_detail?month=' + encodeURIComponent(month));
     if(!data || data.error){
@@ -761,6 +776,7 @@ async function viewPastMonth(){
       resultEl.innerHTML = `<div class="empty-note">No boxes on record for ${month}.</div>`;
       return;
     }
+    lastPastMonthData = data;
     resultEl.innerHTML = `
       <div class="row-line"><span><strong>${data.sent_count}</strong> box${data.sent_count===1?'':'es'} went out in ${month}${data.cancelled_count ? ` <span style="color:var(--muted);">(+${data.cancelled_count} cancelled)</span>` : ''}</span></div>
       ${data.boxes.map(b => `
@@ -772,9 +788,63 @@ async function viewPastMonth(){
         </div>
       `).join('')}
     `;
+    if(data.sent_count){
+      document.getElementById('pamphletTextArea').value = buildPamphletText(data);
+      pamphletArea.style.display = 'block';
+    }
   }catch(e){
     resultEl.innerHTML = `<div class="empty-note">Could not load that month: ${e.message}</div>`;
   }
+}
+
+// Builds the readable, pamphlet-ready text: one block per customer who
+// actually got a box that month (cancelled boxes skipped -- nothing to
+// print a pamphlet for), name / month / tier on one line, items listed
+// below, a blank line between customers so it pastes cleanly anywhere.
+function buildPamphletText(data){
+  const blocks = (data.boxes || [])
+    .filter(b => String(b.status).toLowerCase() !== 'cancelled')
+    .map(b => {
+      const header = `${b.customer_name} — ${data.month}${b.box_type ? ' — ' + b.box_type : ''}`;
+      const items = (b.products && b.products.length)
+        ? b.products.map(p => `- ${p}`).join('\n')
+        : '- (no items on record)';
+      return `${header}\n${items}`;
+    });
+  return blocks.join('\n\n');
+}
+
+async function copyPamphletText(){
+  const ta = document.getElementById('pamphletTextArea');
+  const btn = document.getElementById('pamphletCopyBtn');
+  const text = ta.value;
+  const flash = (label) => { const orig = btn.textContent; btn.textContent = label; setTimeout(()=>{ btn.textContent = orig; }, 1800); };
+  try{
+    await navigator.clipboard.writeText(text);
+    flash('✔ Copied');
+  }catch(e){
+    // Clipboard API blocked (permissions, non-HTTPS context, etc.) --
+    // fall back to selecting the text so a manual Ctrl/Cmd+C still works.
+    ta.focus();
+    ta.select();
+    flash('Select-all ready — press Ctrl/Cmd+C');
+  }
+}
+
+async function resyncBoard(){
+  if(!confirm("Re-check everyone currently on this month's board against their CURRENT status, and remove anyone who's been paused or cancelled since the board was generated (even if that happened outside the dashboard)? Any already-approved items for someone removed get put back into stock. This won't touch anyone still active, and won't add or re-pick anything.")) return;
+  try{
+    const data = await postForm('/dashboard/resync_board', {});
+    if(!data || data.error){ alert('Could not resync: ' + ((data && data.error) || 'unknown error')); return; }
+    if(data.message){ alert(data.message); return; }
+    if(!data.removed_count){
+      alert('Everyone currently on the board is still active — nothing to remove.');
+    } else {
+      const lines = data.removed.map(r => `• ${r.customer_name} (${r.status})${r.restocked_count ? ` — ${r.restocked_count} item${r.restocked_count===1?'':'s'} restocked` : ''}`).join('\n');
+      alert(`Removed ${data.removed_count} customer${data.removed_count===1?'':'s'} who are no longer active:\n\n${lines}\n\n${data.remaining_count} customer${data.remaining_count===1?'':'s'} remain on the board.`);
+    }
+    await loadBoard();
+  }catch(e){ alert('Could not resync: ' + e.message); }
 }
 
 function stepInvQty(delta){
@@ -1179,6 +1249,16 @@ function labelize(k){
    instead of having to create her blank and then hunt for an edit
    screen. Backed by /dashboard/create_customer, which reuses the exact
    same quiz/preference-saving logic as editing an existing customer. */
+// Same 20 categories recommend_v5.py's FREQ_TO_CAT maps against, in the
+// same Skincare -> Face -> Eyes -> Lips grouping it uses -- this is the
+// authoritative full list of "how often does she want X" quiz questions.
+const NEW_CUST_FREQ_CATEGORIES = [
+  'cleanser','eye_treatment','serum_moisturizer','sheet_masks',
+  'primer','concealer','foundation','makeup_tools','powder','blush','bronzer_contour','highlighter',
+  'mascara','brows','eyeshadow','eyeliner',
+  'lipstick','liquid_lipstick','lip_gloss','lip_liner',
+];
+
 function openNewCustomerForm(){
   const area = document.getElementById('newCustomerFormArea');
   area.innerHTML = `
@@ -1247,7 +1327,48 @@ function openNewCustomerForm(){
           <input id="newCustMakeupComfort" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
         </label>
       </div>
-      <div style="font-size:11px;color:var(--muted);margin-top:6px;">Category frequencies (how often she wants Lips, Eyes, etc.) and style/shopping preferences aren't on this form — add those from her profile page once she's created, the same way you'd correct them for anyone else.</div>
+      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:16px 0 4px;">How often she wants each category (optional — leave as "not asked" for anything she wasn't actually asked; you can always fill the rest in later from her profile)</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+        ${NEW_CUST_FREQ_CATEGORIES.map(cat => `
+        <label style="font-size:12px;color:var(--muted);">${labelize(cat)}
+          <select id="newCustFreq-${cat}" style="width:100%;padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+            <option value="">— not asked —</option>
+            <option value="Often">Often</option>
+            <option value="Sometimes">Sometimes</option>
+            <option value="Rarely">Rarely</option>
+          </select>
+        </label>
+        `).join('')}
+      </div>
+
+      <div style="font-size:12px;font-weight:700;color:var(--muted);margin:16px 0 4px;">Style &amp; shopping preferences (optional)</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <label style="font-size:12px;color:var(--muted);">Lips color
+          <input id="newCustPrefLipsColor" placeholder="reds, berries, neutrals, plums, pinks, peach, mauves, adventurous, dark, pastels, smokey" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Eyeshadow color
+          <input id="newCustPrefEyeshadowColor" placeholder="same wording as lips color" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Blush color
+          <input id="newCustPrefBlushColor" placeholder="same wording as lips color" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Nail color
+          <input id="newCustPrefNailColor" placeholder="e.g. red, nude, pastel, bold colors" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Skin concerns
+          <input id="newCustPrefSkinConcerns" placeholder="oiliness, dryness, wrinkles, acne, hyper-pigmentation, redness" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Hair concerns
+          <input id="newCustPrefHairConcerns" placeholder="Frizzy, Dry and damaged, Needs volume, Split Ends" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Scent preference
+          <input id="newCustPrefScent" placeholder="Floral, Earthy & woody, Fresh, Spicy" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+        <label style="font-size:12px;color:var(--muted);">Shopping habits
+          <input id="newCustPrefShopping" placeholder="free text — e.g. budget-conscious, loves trying new brands" style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-top:3px;">
+        </label>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px;">For the shade/concern fields, stick to the wording shown in the grey placeholder text (comma-separated) — that's what the box-picking logic actually matches against. Anything typed differently is still saved, just won't influence her recommendations until corrected.</div>
 
       <div style="margin-top:14px;"><button class="btn btn-approve" onclick="createNewCustomer()">Create customer</button></div>
       <div id="newCustResult" style="margin-top:8px;"></div>
@@ -1276,6 +1397,18 @@ async function createNewCustomer(){
     hair_color: val('newCustHairColor'),
     makeup_comfort: val('newCustMakeupComfort'),
   };
+  NEW_CUST_FREQ_CATEGORIES.forEach(cat=>{
+    const el = document.getElementById('newCustFreq-'+cat);
+    payload['freq_'+cat] = el ? el.value : '';
+  });
+  payload['pref_lips_color'] = val('newCustPrefLipsColor');
+  payload['pref_eyeshadow_color'] = val('newCustPrefEyeshadowColor');
+  payload['pref_blush_color'] = val('newCustPrefBlushColor');
+  payload['pref_nail_color'] = val('newCustPrefNailColor');
+  payload['pref_skin_concerns'] = val('newCustPrefSkinConcerns');
+  payload['pref_hair_concerns'] = val('newCustPrefHairConcerns');
+  payload['pref_scent_preference'] = val('newCustPrefScent');
+  payload['pref_shopping_habits'] = val('newCustPrefShopping');
   try{
     const data = await postForm('/dashboard/create_customer', payload);
     if(!data || data.error){ alert('Could not create customer: ' + ((data && data.error) || 'unknown error')); return; }
