@@ -80,6 +80,12 @@ def load_customers():
             'first_box_month': str(row[11]) if row[11] else '',
             'notes': row[14] or '',
             'last_payment_confirmed': str(row[15]) if len(row) > 15 and row[15] else '',
+            # Set (to a short human-readable reason, not just True/False) by
+            # _create_customer_core() when a customer is created automatically
+            # from Make.com -- e.g. straight off a Stripe payment with no
+            # matching quiz on file. Cleared by /dashboard/mark_reviewed once
+            # Iqra's actually looked at her and confirmed everything's right.
+            'needs_review': str(row[16]).strip() if len(row) > 16 and row[16] else '',
         }
     return out
 

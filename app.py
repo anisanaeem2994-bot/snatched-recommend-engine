@@ -28,6 +28,7 @@ Endpoints:
 from flask import Flask, request, jsonify, session, redirect, url_for
 import os
 import re
+import json
 import tempfile
 import importlib
 import recommend_v5
@@ -407,6 +408,7 @@ def customer_lookup_endpoint():
             'birthday': cust.get('birthday'),
             'notes': cust.get('notes'),
             'last_payment_confirmed': cust.get('last_payment_confirmed'),
+            'needs_review': cust.get('needs_review') or '',
             'boxes': customer_boxes[:8],
             'shade_notes': shade_notes,
             'blocked_brands': blocked_brands,
@@ -551,11 +553,23 @@ def dashboard_resync_board():
         blocks = _parse_dash_sheet(ws_board)
 
         removed = []
+        unmatched = []
         rows_to_delete = []
         for b in blocks:
             cust = customers.get(b['customer_id'])
-            status = str((cust or {}).get('status', '')).strip().lower()
-            if cust is not None and status not in ('cancelled', 'paused'):
+            if cust is None:
+                # Her customer_id on the board doesn't match anyone in the
+                # customers sheet right now. That is NOT the same thing as
+                # "cancelled/paused" -- it just means we can't confirm her
+                # status one way or the other (a ymbol/format mismatch, a
+                # row that moved, anything). Guessing wrong here means
+                # silently deleting a perfectly live customer's box, so we
+                # leave her on the board untouched and only flag it for a
+                # human to look at.
+                unmatched.append({'customer_id': b['customer_id'], 'customer_name': b['customer_name']})
+                continue
+            status = str(cust.get('status', '')).strip().lower()
+            if status not in ('cancelled', 'paused'):
                 continue  # still active (or blank/other -- same "active" definition used everywhere else)
             restocked = 0
             for it in b['items']:
@@ -564,7 +578,7 @@ def dashboard_resync_board():
                         restocked += 1
             removed.append({
                 'customer_id': b['customer_id'], 'customer_name': b['customer_name'],
-                'status': (cust or {}).get('status') or 'not found', 'restocked_count': restocked,
+                'status': cust.get('status'), 'restocked_count': restocked,
             })
             rows_to_delete += [b['header_row']] + [i['row_number'] for i in b['items']]
 
@@ -576,6 +590,7 @@ def dashboard_resync_board():
 
         return jsonify({
             'success': True, 'removed': removed, 'removed_count': len(removed),
+            'unmatched': unmatched, 'unmatched_count': len(unmatched),
             'remaining_count': len(blocks) - len(removed),
         })
     except Exception as e:
@@ -779,6 +794,13 @@ CUSTOMER_EDITABLE_FIELDS = {
     'last_payment_confirmed': 16,
 }
 
+# Column 17 -- separate from CUSTOMER_EDITABLE_FIELDS because this is never
+# something Iqra types in herself. Set by _create_customer_core() (to a
+# short human-readable reason) whenever Make.com creates a customer
+# automatically with no human having looked at her yet; cleared by
+# /dashboard/mark_reviewed once Iqra has.
+NEEDS_REVIEW_COL = 17
+
 @app.route('/dashboard/edit_customer', methods=['POST'])
 @dashboard_login_required
 def dashboard_edit_customer():
@@ -895,15 +917,23 @@ def dashboard_create_customer():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def _create_customer_core(form):
+def _create_customer_core(form, mark_needs_review=False, review_reason=None):
     """Shared core of dashboard_create_customer() and
-    dashboard_quiz_submission() -- generates the next CUSTOMER_ID,
+    dashboard_confirm_subscription() -- generates the next CUSTOMER_ID,
     writes the new row, and fills in any quiz/frequency/preference
     fields present, via _apply_preference_updates. `form` is anything
     dict-like with .get()/.items()/'in' support -- a real request.form,
-    or a plain dict built from a parsed quiz email. Raises
+    or a plain dict built from a parsed quiz/subscription email. Raises
     ValueError('name is required.') if name is missing. Returns
-    (new_id, name, quiz_updated)."""
+    (new_id, name, quiz_updated).
+
+    mark_needs_review=True flags the new row so it shows up in Iqra's
+    "needs review" list on Home -- used only when Make.com creates a
+    customer with nobody having looked at her yet. review_reason is the
+    short human-readable string stored in that column (shown to Iqra
+    as-is), e.g. 'New from quiz' or 'New from payment -- no quiz on
+    file'. A customer Iqra creates herself from the dashboard never gets
+    this -- she already knows what she just typed in."""
     name = (form.get('name') or '').strip()
     if not name:
         raise ValueError('name is required.')
@@ -939,7 +969,31 @@ def _create_customer_core(form):
         # month. Computed fresh here so a Make.com-created customer (or
         # any manual add that doesn't specify it) always gets this right
         # without anyone having to remember the cutoff by hand.
-        ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['first_box_month']).value = recommend_v5.compute_first_box_month()
+        #
+        # Important: this must be measured against when she actually
+        # subscribed, NOT whenever this record happens to get created --
+        # Make.com (or a manual catch-up add) can easily process a real
+        # signup days late, and if that lag crosses the 19th, using
+        # "right now" would silently bump her into the wrong month. If a
+        # subscribed_since was given (and parses as a real date), the
+        # cutoff is measured against THAT date instead.
+        as_of = None
+        sub_since = form.get('subscribed_since')
+        if sub_since:
+            try:
+                as_of = _datetime.strptime(str(sub_since)[:10], '%Y-%m-%d')
+            except (ValueError, TypeError):
+                as_of = None
+        ws_c.cell(new_row, CUSTOMER_EDITABLE_FIELDS['first_box_month']).value = recommend_v5.compute_first_box_month(as_of)
+
+    if mark_needs_review:
+        # Self-healing header, same pattern as last_payment_confirmed above --
+        # this column didn't always exist, so make sure it's labeled the
+        # first time anything actually writes to it.
+        header_cell = ws_c.cell(1, NEEDS_REVIEW_COL)
+        if not header_cell.value:
+            header_cell.value = 'needs_review'
+        ws_c.cell(new_row, NEEDS_REVIEW_COL).value = review_reason or 'New customer -- please review'
 
     quiz_updated = _apply_preference_updates(wb, new_id, name, form)
 
@@ -1178,6 +1232,78 @@ def parse_quiz_email(text):
         out['pref_' + key] = ', '.join(values)
     return out
 
+# ---------------------------------------------------------------------
+# Quiz staging -- holds a filled-in quiz's answers until the matching
+# Stripe payment confirms she actually subscribed. Filling the quiz does
+# NOT mean she's paid (plenty of people try the quiz and never subscribe),
+# so nothing gets created on the dashboard off a quiz email alone. Keyed
+# by email, one row per person -- a resubmission just overwrites whatever
+# was staged before. See dashboard_quiz_submission() and
+# dashboard_confirm_subscription() below.
+# ---------------------------------------------------------------------
+PENDING_QUIZ_SHEET = 'pending_quizzes'
+PENDING_QUIZ_HEADERS = ['email', 'name', 'phone', 'staged_at', 'data_json']
+
+def _get_pending_quiz_sheet(create=False):
+    wb = recommend_v5.wb
+    if PENDING_QUIZ_SHEET not in wb.sheetnames:
+        if not create:
+            return None
+        ws = wb.create_sheet(PENDING_QUIZ_SHEET)
+        ws.append(PENDING_QUIZ_HEADERS)
+        return ws
+    return wb[PENDING_QUIZ_SHEET]
+
+def _stage_quiz(parsed):
+    """Upserts parsed quiz answers into the pending_quizzes sheet, keyed by
+    email (case-insensitive). Does NOT save the workbook -- the caller
+    does that once, same convention as _apply_inventory_change()."""
+    ws = _get_pending_quiz_sheet(create=True)
+    email_lower = parsed['email'].strip().lower()
+    target_row = None
+    for row in ws.iter_rows(min_row=2):
+        if row[0].value and str(row[0].value).strip().lower() == email_lower:
+            target_row = row
+            break
+    staged_at = _datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    data_json = json.dumps(parsed)
+    if target_row is not None:
+        target_row[0].value = parsed['email']
+        target_row[1].value = parsed.get('name', '')
+        target_row[2].value = parsed.get('phone', '')
+        target_row[3].value = staged_at
+        target_row[4].value = data_json
+    else:
+        new_row = _next_append_row(ws)
+        ws.cell(new_row, 1).value = parsed['email']
+        ws.cell(new_row, 2).value = parsed.get('name', '')
+        ws.cell(new_row, 3).value = parsed.get('phone', '')
+        ws.cell(new_row, 4).value = staged_at
+        ws.cell(new_row, 5).value = data_json
+
+def _pop_staged_quiz(email):
+    """Looks up and REMOVES a staged quiz by email (case-insensitive) --
+    called once a Stripe payment confirms she's actually subscribed, so
+    the answers get folded into her new customer record and don't sit
+    around afterward. Returns the parsed dict, or None if nothing was
+    ever staged for this email. Does NOT save the workbook."""
+    ws = _get_pending_quiz_sheet(create=False)
+    if ws is None:
+        return None
+    email_lower = email.strip().lower()
+    for r in range(ws.max_row, 1, -1):
+        cell_email = ws.cell(r, 1).value
+        if cell_email and str(cell_email).strip().lower() == email_lower:
+            data_json = ws.cell(r, 5).value
+            ws.delete_rows(r, 1)
+            if data_json:
+                try:
+                    return json.loads(data_json)
+                except (TypeError, ValueError):
+                    return None
+            return None
+    return None
+
 
 @app.route('/dashboard/quiz_submission', methods=['POST'])
 @dashboard_or_api_key_required
@@ -1188,15 +1314,16 @@ def dashboard_quiz_submission():
     here in Python (see parse_quiz_email above) instead of a long, fragile
     chain of Make.com Text Parser modules.
 
-    Creates the customer with her name/email/phone, quiz basics, every
-    category frequency she answered, and every style/shopping preference
-    she answered -- the same thing 'Add new customer' on the dashboard
-    does by hand, done automatically. If a customer with this email
-    already exists (a resubmission, or she signed up another way first),
-    her quiz/preference answers are updated on that existing record
-    instead of creating a duplicate; her name/phone are only filled in if
-    she didn't already have one on file, so this never clobbers something
-    Iqra already corrected by hand."""
+    Filling in the quiz does NOT mean she's subscribed -- plenty of people
+    try it and never pay. So this never creates a customer on its own:
+    - If she's already a confirmed customer (an existing dashboard record
+      matches her email -- she subscribed before, or is retaking the quiz
+      to update her answers), her quiz/preference answers are updated on
+      that existing record immediately, same as before.
+    - Otherwise her answers are just staged (see _stage_quiz above),
+      waiting for the matching Stripe payment to actually confirm she's
+      subscribed -- see dashboard_confirm_subscription() below, which is
+      the only thing that creates a brand-new customer from this flow."""
     raw_text = request.form.get('email_text') or request.form.get('full_text_body') or ''
     if not raw_text.strip():
         return jsonify({'error': "email_text is required (the quiz email's full text body)."}), 400
@@ -1238,17 +1365,283 @@ def dashboard_quiz_submission():
             wb.save(recommend_v5.path)
             push_to_github_async()
             return jsonify({
-                'success': True, 'created': False, 'customer_id': customer_id,
+                'success': True, 'created': False, 'staged': False, 'customer_id': customer_id,
                 'name': name, 'quiz_updated': quiz_updated,
             })
 
-        new_id, name, quiz_updated = _create_customer_core(parsed)
+        _stage_quiz(parsed)
+        wb.save(recommend_v5.path)
+        push_to_github_async()
         return jsonify({
-            'success': True, 'created': True, 'customer_id': new_id,
-            'name': name, 'quiz_updated': quiz_updated,
+            'success': True, 'created': False, 'staged': True,
+            'name': parsed['name'], 'email': parsed['email'],
         })
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ---------------------------------------------------------------------
+# Subscription-payment email parsing (New subscription Make.com scenario)
+# ---------------------------------------------------------------------
+# IMPORTANT: an earlier version of this parser was built against a generic
+# Stripe "payment received" receipt pulled from Make's execution history.
+# Iqra corrected this on 2026-10-24 -- that's NOT what actually lands in
+# the inbox for a new subscription. The real email, sent by the
+# Snatched Beauty Box site itself (no-reply@snatchedbox.com, subject
+# "Snatchedbox New Order Subscription"), looks like this:
+#
+#   Hello, New Membership User registration on: Snatched Beauty Box
+#   Date Registered: October 14, 2026
+#   Username:Alice Moffatt
+#   Full name:Alice Moffatt
+#   Email:beth.robins@nasabudhabi.ae
+#   Gender:female
+#   DOB:2013-09-09
+#   Address:254 Noya Yas Island
+#   CityAbu Dhabi
+#   Phone:+971-585267539
+#   Plan Details:Monthly Essentials Box
+#   Payment Method:Stripe
+#   Have a nice day!
+#
+# A few things worth noting from that real sample: most labels are
+# "Label:value" on one line, but "City" came through with NO colon at all
+# ("CityAbu Dhabi") -- almost certainly an HTML->text quirk of this one
+# template, not something to rely on being consistent, so the colon is
+# optional in every pattern below rather than assumed. "Payment Method"
+# is NOT always Stripe -- Iqra confirmed it can also read "Cash" (and
+# possibly other values), so nothing here should assume or require it to
+# equal "Stripe"; the fact that this email arrived at all is what means
+# she's subscribed, regardless of how she paid. "Plan Details" bundles
+# the billing cadence and box type together ("Monthly Essentials Box") --
+# split apart below to match how the customers sheet stores them
+# separately (billing_cadence: "Monthly", box_type: "Essentials").
+_SUB_LABEL_PATTERNS = [
+    ('date_registered', re.compile(r'^Date\s*Registered\s*:?\s*(.+)$', re.I)),
+    ('username',        re.compile(r'^Username\s*:?\s*(.+)$', re.I)),
+    ('name',            re.compile(r'^Full\s*name\s*:?\s*(.+)$', re.I)),
+    ('email',           re.compile(r'^Email\s*:?\s*(.+)$', re.I)),
+    ('gender',          re.compile(r'^Gender\s*:?\s*(.+)$', re.I)),
+    ('birthday',        re.compile(r'^DOB\s*:?\s*(.+)$', re.I)),
+    ('address',         re.compile(r'^Address\s*:?\s*(.+)$', re.I)),
+    ('city',            re.compile(r'^City\s*:?\s*(.+)$', re.I)),
+    ('phone',           re.compile(r'^Phone\s*:?\s*(.+)$', re.I)),
+    ('plan_details',    re.compile(r'^Plan\s*Details\s*:?\s*(.+)$', re.I)),
+    ('payment_type',    re.compile(r'^Payment\s*Method\s*:?\s*(.+)$', re.I)),
+]
+# "Monthly Essentials Box" -> cadence "Monthly", box type "Essentials".
+# Falls back to leaving billing_cadence blank and using the whole phrase
+# as box_type if it doesn't match this shape -- better a slightly odd
+# box_type (easy to fix on a needs_review profile) than silently losing
+# the plan info entirely.
+_PLAN_SPLIT_RE = re.compile(
+    r'^(Monthly|Bi-?Monthly|Quarterly|Annual|Yearly)\s+(.+?)\s*Box\s*$', re.I)
+
+def parse_subscription_email(text, subject=''):
+    """Parses a 'Snatchedbox New Order Subscription' email's full text body
+    into fields ready for _create_customer_core()/_apply_preference_updates:
+    name, email, phone, city, birthday, payment_type, box_type,
+    billing_cadence, plus a few informational-only extras (username,
+    gender, address, date_registered, plan_details). 'email' is the one
+    fully reliable field -- it's the matching key used to tie this
+    subscription back to a quiz staged earlier (see _stage_quiz) and to
+    any existing customer record. Unrecognized lines are skipped rather
+    than guessed at, same convention as parse_quiz_email above, so a
+    template tweak degrades gracefully instead of corrupting data."""
+    out = {k: '' for k, _ in _SUB_LABEL_PATTERNS}
+    out['box_type'] = ''
+    out['billing_cadence'] = ''
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for field, pattern in _SUB_LABEL_PATTERNS:
+            m = pattern.match(line)
+            if m:
+                out[field] = m.group(1).strip()
+                break
+
+    if out['plan_details']:
+        m = _PLAN_SPLIT_RE.match(out['plan_details'])
+        if m:
+            out['billing_cadence'] = m.group(1).strip()
+            out['box_type'] = m.group(2).strip()
+        else:
+            # Didn't match the expected "<cadence> <box type> Box" shape --
+            # keep the raw phrase visible as box_type so it isn't lost,
+            # Iqra can clean it up via the needs_review flag.
+            out['box_type'] = out['plan_details']
+
+    if not out['name']:
+        out['name'] = out['username']
+
+    return out
+
+@app.route('/dashboard/confirm_subscription', methods=['POST'])
+@dashboard_or_api_key_required
+def dashboard_confirm_subscription():
+    """Make.com's 'New subscription' scenario calls this (X-Api-Key:
+    MAKE_API_KEY) with the "Snatchedbox New Order Subscription" email's
+    subject ('subject' form field) and full text body ('email_text') --
+    see parse_subscription_email above. That email arriving at all is what
+    actually means she's subscribed (filling the quiz alone doesn't, and
+    the payment could be Stripe OR cash -- both count), so this is the
+    ONLY thing in the Make.com setup that creates a brand-new customer:
+
+    - If her email already matches an existing customer, this is just a
+      renewal/recurring charge -- nothing new to create, just stamp
+      last_payment_confirmed with today's date (the exact job the old
+      separate 'Payment Confirmation' scenario was for; this email
+      already means paid, so that scenario is no longer needed).
+    - If her email doesn't match anyone yet, she's a brand-new paying
+      customer. If a quiz was staged earlier for this same email, it's
+      pulled in and used as the base profile (her quiz answers win on
+      overlap), topped up with whatever this subscription email itself
+      has that the quiz doesn't -- city, birthday, payment_type, box_type,
+      billing_cadence. If no quiz was ever staged (she paid without
+      taking it, or under a different email), she's still created from
+      the subscription email alone, which on its own already carries
+      name/email/phone/city/birthday/plan/payment method -- rather than
+      silently lost. Either way the new record is flagged 'needs review'
+      so Iqra can give it a quick look before it's treated as final."""
+    subject = request.form.get('subject', '')
+    raw_text = request.form.get('email_text') or request.form.get('full_text_body') or ''
+    if not raw_text.strip():
+        return jsonify({'error': "email_text is required (the subscription email's full text body)."}), 400
+
+    try:
+        parsed = parse_subscription_email(raw_text, subject)
+    except Exception as e:
+        return jsonify({'error': f'Could not parse subscription email: {e}'}), 400
+
+    if not parsed.get('email'):
+        return jsonify({'error': 'Could not find a customer email in the subscription email.'}), 422
+
+    # Only the fields _create_customer_core actually knows how to file
+    # (see CUSTOMER_EDITABLE_FIELDS) -- used below to top up a staged
+    # quiz or as the whole profile when there's no quiz on file.
+    sub_fields = {k: parsed.get(k) for k in
+                  ('phone', 'city', 'birthday', 'payment_type', 'box_type', 'billing_cadence')
+                  if parsed.get(k)}
+
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        email_col = CUSTOMER_EDITABLE_FIELDS['email']
+        payment_col = CUSTOMER_EDITABLE_FIELDS['last_payment_confirmed']
+        email_lower = parsed['email'].strip().lower()
+
+        existing_row = None
+        for row in ws_c.iter_rows(min_row=2):
+            cell_email = row[email_col - 1].value
+            if cell_email and str(cell_email).strip().lower() == email_lower:
+                existing_row = row
+                break
+
+        if existing_row is not None:
+            # Renewal / recurring charge for someone already on the
+            # dashboard -- just stamp the payment date, same as the old
+            # dashboard_confirm_payment() endpoint did.
+            header_cell = ws_c.cell(1, payment_col)
+            if not header_cell.value:
+                header_cell.value = 'last_payment_confirmed'
+            today_str = _datetime.now().strftime('%Y-%m-%d')
+            existing_row[payment_col - 1].value = today_str
+            wb.save(recommend_v5.path)
+            push_to_github_async()
+            return jsonify({
+                'success': True, 'created': False, 'action': 'payment_confirmed',
+                'customer_id': existing_row[0].value, 'last_payment_confirmed': today_str,
+            })
+
+        # Brand-new paying customer. Pull in her staged quiz if she has
+        # one -- that's the normal path (quiz first, pay second).
+        staged = _pop_staged_quiz(parsed['email'])
+        if staged:
+            # Quiz answers win on any overlap; the subscription email just
+            # fills in whatever the quiz never asked about (city, DOB,
+            # payment type, box type/cadence).
+            merged_form = dict(sub_fields)
+            merged_form.update({k: v for k, v in staged.items() if v})
+
+            # Same email on both, but a different name? That's exactly the
+            # kind of thing this must NOT silently guess its way through
+            # (e.g. someone subscribing under her own email but for a
+            # friend who took the quiz, or the reverse) -- surface it
+            # clearly for Iqra to look at and confirm instead of quietly
+            # picking one name over the other.
+            quiz_name = (staged.get('name') or '').strip().lower()
+            sub_name = (parsed.get('name') or '').strip().lower()
+            if quiz_name and sub_name and quiz_name != sub_name:
+                review_reason = (f'Name mismatch under the same email — quiz says '
+                                  f'"{staged.get("name")}", subscription email says '
+                                  f'"{parsed.get("name")}". Confirm which name/identity is correct.')
+            else:
+                review_reason = 'New from quiz + payment'
+
+            new_id, name, quiz_updated = _create_customer_core(
+                merged_form, mark_needs_review=True, review_reason=review_reason)
+        else:
+            # Paid without a quiz on file under this email. Don't lose
+            # her -- the subscription email alone already has
+            # name/email/phone/city/birthday/plan/payment method, so
+            # create her from that directly, flagged clearly so Iqra
+            # knows to give the profile a once-over.
+            fallback_form = dict(sub_fields)
+            fallback_form['name'] = parsed.get('name') or parsed['email'].split('@')[0]
+            fallback_form['email'] = parsed['email']
+            new_id, name, quiz_updated = _create_customer_core(
+                fallback_form, mark_needs_review=True,
+                review_reason='New from payment -- no quiz on file')
+
+        header_cell = ws_c.cell(1, CUSTOMER_EDITABLE_FIELDS['last_payment_confirmed'])
+        if not header_cell.value:
+            header_cell.value = 'last_payment_confirmed'
+        today_str = _datetime.now().strftime('%Y-%m-%d')
+        for row in ws_c.iter_rows(min_row=2):
+            if row[0].value == new_id:
+                row[CUSTOMER_EDITABLE_FIELDS['last_payment_confirmed'] - 1].value = today_str
+                break
+        wb.save(recommend_v5.path)
+        push_to_github_async()
+        return jsonify({
+            'success': True, 'created': True, 'action': 'created',
+            'customer_id': new_id, 'name': name, 'quiz_matched': bool(staged),
+            'quiz_updated': quiz_updated,
+        })
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/mark_reviewed', methods=['POST'])
+@dashboard_login_required
+def dashboard_mark_reviewed():
+    """Clears the 'needs review' flag on a customer once Iqra's actually
+    looked at her profile and confirmed everything's right -- see
+    NEEDS_REVIEW_COL. The only way this flag gets cleared; it's never
+    time-based or automatic."""
+    customer_id = request.form.get('customer_id')
+    if not customer_id:
+        return jsonify({'error': 'customer_id is required.'}), 400
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        ws_c = wb['customers']
+        target_row = None
+        for row in ws_c.iter_rows(min_row=2):
+            if row[0].value == customer_id:
+                target_row = row
+                break
+        if not target_row:
+            return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
+        target_row[NEEDS_REVIEW_COL - 1].value = ''
+        wb.save(recommend_v5.path)
+        push_to_github_async()
+        return jsonify({'success': True, 'customer_id': customer_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2140,9 +2533,22 @@ def dashboard_home_stats():
             key=lambda c: c['subscribed_since'] or ''
         )
 
+        # Customers Make.com created automatically with nobody having
+        # looked at them yet -- straight off a Stripe payment, with or
+        # without a matching quiz. Stays on this list until Iqra opens her
+        # profile and marks it reviewed (see /dashboard/mark_reviewed) --
+        # not time-based, so nobody slips through just because a day passed.
+        pending_review = sorted(
+            [
+                {'id': c['id'], 'name': c['name'], 'reason': c.get('needs_review')}
+                for c in customers.values() if c.get('needs_review')
+            ],
+            key=lambda c: c['name'].lower()
+        )
+
         return jsonify({
             'birthdays': birthdays, 'low_stock_categories': low_stock, 'low_stock_threshold': LOW_STOCK_THRESHOLD,
-            'new_customers': new_customers,
+            'new_customers': new_customers, 'pending_review': pending_review,
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
