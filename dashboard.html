@@ -482,7 +482,14 @@ async function api(path, opts){
   let data = null;
   try{ data = await res.json(); } catch(e){}
   if(!res.ok && data && !data.hasOwnProperty('found')){
-    throw new Error((data && data.error) || `Request to ${path} failed (${res.status})`);
+    const err = new Error((data && data.error) || `Request to ${path} failed (${res.status})`);
+    // Carries the full error payload along with the thrown Error so callers
+    // that need more than the message (e.g. generateMonth's confirm-and-
+    // retry flow, which needs res.unfinished_customers) can still get at it
+    // -- a plain throw here used to swallow it, since await'ing api() never
+    // actually hands back the response body on a non-2xx status.
+    err.data = data;
+    throw err;
   }
   return data;
 }
@@ -620,15 +627,6 @@ async function generateMonth(force){
     if(force) fields.force = 'true';
     const res = await postForm('/dashboard/generate_month', fields);
     if(!res) return;
-    if(res.error && res.unfinished_customers){
-      const proceed = confirm(
-        `These customers still have unfinished work from before: ${res.unfinished_customers.join(', ')}.\n\n` +
-        `Generating again will replace it. Continue?`
-      );
-      if(proceed) return generateMonth(true);
-      return;
-    }
-    if(res.error){ warnEl.textContent = '⚠ ' + res.error; warnEl.style.display='block'; return; }
     if(res.skipped && res.skipped.length){
       warnEl.innerHTML = `ℹ️ ${res.skipped.length} customer${res.skipped.length===1?'':'s'} skipped this month:<br>` +
         res.skipped.map(s => `&nbsp;&nbsp;• <strong>${s.name}</strong> — ${s.reason}`).join('<br>') +
@@ -638,6 +636,22 @@ async function generateMonth(force){
     await loadBoard();
     showPage('review');
   }catch(e){
+    // api() now attaches the parsed error body to e.data -- this is where
+    // the "unfinished work already on the board" case actually has to be
+    // handled, since a non-2xx response always lands here as a thrown
+    // error, never as a normal return value above. The old code checked
+    // res.unfinished_customers up in the try block, which the server did
+    // send, but it could never be reached because the throw happened first
+    // -- so this confirm-and-retry prompt never actually appeared, and
+    // Generate just dead-ended on the flat warning text below instead.
+    if(e.data && e.data.unfinished_customers){
+      const proceed = confirm(
+        `These customers still have unfinished work from before: ${e.data.unfinished_customers.join(', ')}.\n\n` +
+        `Generating again will replace it. Continue?`
+      );
+      if(proceed) return generateMonth(true);
+      return;
+    }
     warnEl.textContent = '⚠ ' + e.message;
     warnEl.style.display = 'block';
   }
@@ -1124,6 +1138,10 @@ const manualCatalogCache = {}; // rowKey -> {items, total, blocked_count, box_ty
 async function toggleManual(rowNumber){
   const rk = rowKey(rowNumber);
   const panel = document.getElementById('manual-'+rk);
+  // panel can be null if the board re-rendered (new row numbers) between
+  // when this row was drawn and when it was clicked -- without this guard
+  // the next line throws, uncaught, and silently breaks the page.
+  if(!panel){ await loadBoard(); return; }
   const wasOpen = panel.classList.contains('open');
   document.querySelectorAll('.manual-panel.open').forEach(p=>p.classList.remove('open'));
   if(wasOpen){ openManualRowKey = null; return; }
@@ -1140,8 +1158,7 @@ async function loadManualCatalog(rowNumber){
     const data = await api('/dashboard/eligible_products?row_number=' + rowNumber);
     if(!data || data.error){ infoEl.textContent = 'Could not load her product list: ' + ((data && data.error) || 'unknown error'); return; }
     manualCatalogCache[rk] = data;
-    const tierLabel = (data.eligible_tiers||[]).join(' + ') || data.box_type || 'her tier';
-    infoEl.innerHTML = `📋 <b>${data.total} products</b> match her <b>${data.box_type||'—'}</b> tier (${tierLabel}) · ` +
+    infoEl.innerHTML = `📋 <b>${data.total} products</b> — the full catalog, any category or tier (her usual tier is <b>${data.box_type||'—'}</b>; anything else is just tagged below, not hidden) · ` +
       (data.blocked_count
         ? `<span style="color:var(--red);font-weight:700;">${data.blocked_count} flagged below — she doesn't want that brand.</span>`
         : `<b>0 excluded</b> — no brands blocked for her right now.`);
@@ -1174,11 +1191,12 @@ function renderManualList(rowNumber, filterText){
   items.forEach(p=>{
     if(p.category !== lastCat){ html += `<div class="manual-cat-label">${p.category||'Other'}</div>`; lastCat = p.category; }
     const cls = p.in_box ? 'in-box' : (p.blocked ? 'blocked' : '');
+    const tierNote = p.out_of_tier ? ` <span style="color:var(--amber,#b8860b);font-weight:600;">· outside her usual tier</span>` : '';
     const tag = p.in_box
       ? `<span class="mr-inbox-tag">✓ currently in box</span>`
       : (p.blocked
           ? `<span class="mr-blocked-tag">⚠ she doesn't want this — ${p.brand}</span>`
-          : `<span class="mr-meta">${p.tier} · AED ${p.price} · stock ${p.stock}</span>`);
+          : `<span class="mr-meta">${p.tier} · AED ${p.price} · stock ${p.stock}${tierNote}</span>`);
     html += `<div class="manual-result ${cls}" onclick="selectManual(${rowNumber}, '${jsAttrEscape(p.name)}')">
         <span class="mr-name">${p.name}</span>${tag}
       </div>`;
@@ -1209,6 +1227,7 @@ async function selectManual(rowNumber, productName){
       if(res.blocked) msgs.push(`⚠️ You blocked ${res.brand} for this customer — double-check before sending.`);
       if(res.brand_clash) msgs.push(`Heads up — she already has another ${res.brand} product elsewhere in this box.`);
       if(res.repeat) msgs.push(`Heads up — she's received this exact product before.`);
+      if(res.value_warning) msgs.push(`💰 ${res.value_warning}`);
       if(msgs.length){ warnEl.textContent = '⚠ '+msgs.join(' '); warnEl.classList.add('show'); okEl.classList.remove('show'); }
       else { okEl.textContent = '✓ Checked — no brand repeat in this box and no repeat in her history.'; okEl.classList.add('show'); warnEl.classList.remove('show'); }
     }, 30);

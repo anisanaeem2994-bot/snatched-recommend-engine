@@ -3284,12 +3284,15 @@ def dashboard_swap_category():
 @dashboard_login_required
 def dashboard_eligible_products():
     """Powers the 'Enter my own' picker list. Given a row_number, returns
-    every real, in-stock product that matches the customer's tier (for a
-    Mixed box, that means both Essentials and Prestige, since that's what
-    her box actually draws from) -- NOT the whole catalog.
+    every real, in-stock product in the ENTIRE catalog -- any category, any
+    tier -- not just whatever matches the customer's own box_type. This is a
+    manual override tool: Iqra should be free to put anything in a box if
+    that's her call to make, so nothing here is hidden for not matching her
+    usual tier. Each item is tagged with whether it's outside her tier
+    (out_of_tier) purely as a heads-up, never as a block.
 
     Products from a brand she has strictly blocked are NOT removed from
-    this list -- Iqra asked for them to still be visible but clearly
+    this list either -- Iqra asked for them to still be visible but clearly
     flagged, so she can see at a glance what NOT to pick rather than
     wondering why something is missing. The automatic recommend/swap
     engine (recommend_v5.recommend, find_alternative) already hard-excludes
@@ -3321,8 +3324,6 @@ def dashboard_eligible_products():
         for p in inventory:
             if (p['stock'] or 0) <= 0:
                 continue
-            if eligible_tiers and p['tier'] not in eligible_tiers:
-                continue
             brand = recommend_v5.get_brand(p['name'])
             items.append({
                 'name': p['name'], 'category': p['category'], 'tier': p['tier'],
@@ -3330,6 +3331,10 @@ def dashboard_eligible_products():
                 'brand': brand,
                 'blocked': brand in blocked_brands,
                 'in_box': p['name'].strip().lower() in current_names_lower,
+                # Informational only -- never filtered out. Lets the picker UI
+                # show a quiet "outside her usual tier" note instead of hiding
+                # the product, since Iqra can freely pick across any tier now.
+                'out_of_tier': bool(eligible_tiers) and p['tier'] not in eligible_tiers,
             })
         items.sort(key=lambda x: (x['category'] or '', x['name'] or ''))
 
@@ -3402,8 +3407,30 @@ def dashboard_manual_pick():
         recommend_v5.wb.save(recommend_v5.path)
         push_to_github_async()
 
+        # Since she can now manually pick from any tier/category, a box can
+        # end up well above its usual retail-value target (e.g. a Prestige
+        # item dropped into an Essentials box). That's allowed -- it's her
+        # call -- but flag it clearly rather than letting it pass silently.
+        box_type_for_value = cust['box_type'] if cust else None
+        target_value = recommend_v5.BOX_VALUE_TARGETS.get(box_type_for_value)
+        new_total = round(sum(
+            (product.get('retail_price_aed') or 0) if i['row_number'] == row_number else (i['price'] or 0)
+            for i in block['items']
+        ), 2)
+        value_warning = None
+        if target_value and new_total > target_value:
+            value_warning = (
+                f"Box retail value is now AED {new_total}, which is AED "
+                f"{round(new_total - target_value, 2)} above the usual AED {target_value} "
+                f"target for a {box_type_for_value} box — still fine to send, just double-check it."
+            )
+
         updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
-        return jsonify({'success': True, 'item': updated, 'brand_clash': brand_clash, 'repeat': repeat, 'blocked': blocked, 'brand': new_brand})
+        return jsonify({
+            'success': True, 'item': updated, 'brand_clash': brand_clash, 'repeat': repeat,
+            'blocked': blocked, 'brand': new_brand, 'value_warning': value_warning,
+            'box_total': new_total, 'box_target': target_value,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
