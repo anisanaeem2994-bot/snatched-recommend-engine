@@ -746,7 +746,14 @@ function renderItemRow(it){
    device issue, it just stopped getting re-filled after your first action. */
 function categoryOptionsHTML(){
   if(!inventoryCatalog) return '';
-  const cats = [...new Set(inventoryCatalog.map(p=>p.category))].sort();
+  // .filter(Boolean) drops any product with a blank/missing category instead
+  // of letting it into this list as a literal null -- a handful of real
+  // inventory rows (e.g. a few Huda Beauty products) have no category set,
+  // and without this filter the null sits in the list until .replace() is
+  // called on it below, which throws and silently blanks out this whole
+  // dropdown (and anything rendered after it) on every single board action,
+  // not just ones touching those specific products.
+  const cats = [...new Set(inventoryCatalog.map(p=>p.category).filter(Boolean))].sort();
   return cats.map(c=>`<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
 }
 
