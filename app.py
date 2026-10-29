@@ -299,10 +299,28 @@ def _trim_workbook_padding_on_boot():
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             old_max = ws.max_row
+            # Scan BACKWARD from the last row down, stopping at the first
+            # non-empty one -- not forward from row 2 up. On the very first
+            # boot after this fix ships, there's real padding to find either
+            # way, so this costs the same as a forward scan that one time.
+            # But on every boot AFTER that (the normal case, forever), this
+            # sheet already has no padding left -- max_row already equals
+            # the real last row -- so a backward scan finds it on the very
+            # first row it checks, while a forward scan would still have to
+            # walk every single row from 2 up to get there. That difference
+            # is NOT academic: measured live on Render, the forward version
+            # of this scan took roughly 10-20 seconds PER SHEET on a padded
+            # sheet (deploy logs: ~99s total across 7 sheets), and since it
+            # ran unconditionally on every boot, it would have added that
+            # same delay to every single cold start forever, including every
+            # ordinary wake-up after Render's free-tier idle spindown --
+            # which is exactly the kind of "nothing happens for ages" problem
+            # this whole fix exists to get rid of, not reintroduce elsewhere.
             last = 1
-            for r in range(2, old_max + 1):
+            for r in range(old_max, 1, -1):
                 if any(c.value not in (None, '') for c in ws[r]):
                     last = r
+                    break
             if old_max > last:
                 removed = old_max - last
                 ws.delete_rows(last + 1, removed)
@@ -3370,11 +3388,16 @@ def _next_append_row(ws, check_cols=(1, 2)):
     trailing rows, which makes ws.max_row unreliable for finding 'the
     real last row of data' -- using it directly would leave a huge gap
     of blank rows before a freshly appended one. This scans for the
-    actual last row that has something in it instead."""
+    actual last row that has something in it instead. Scans backward from
+    the last row down, same reason as _append_row()'s own backward scan
+    just below -- cheap on a sheet that's already trimmed (the normal case
+    now that the boot-time padding trim exists), instead of always walking
+    forward through every real row first."""
     last = 1
-    for r in range(2, ws.max_row + 1):
+    for r in range(ws.max_row, 1, -1):
         if any(ws.cell(r, c).value not in (None, '') for c in check_cols):
             last = r
+            break
     return last + 1
 
 def _append_row(ws, values):
@@ -3392,12 +3415,20 @@ def _append_row(ws, values):
     enough, since every one of these call sites would have started quietly
     re-inflating it again on the very next use. Mirrors _next_append_row()'s
     real-last-row scan, but checks every column instead of only a couple,
-    since callers here don't all agree on which columns matter. Returns the
-    row number actually written to."""
+    since callers here don't all agree on which columns matter. Scans
+    BACKWARD from the last row down, same reason as
+    _trim_workbook_padding_on_boot()'s own backward scan: once the padding
+    on a sheet has actually been trimmed (which it now is, at boot), there's
+    nothing left past the real last row, so a backward scan confirms that
+    on the very first row it checks -- instead of a forward scan from row 2
+    having to walk every real row just to reach the end, on literally every
+    single write this app makes. Returns the row number actually written
+    to."""
     last = 1
-    for r in range(2, ws.max_row + 1):
+    for r in range(ws.max_row, 1, -1):
         if any(c.value not in (None, '') for c in ws[r]):
             last = r
+            break
     target_row = last + 1
     for i, v in enumerate(values, start=1):
         ws.cell(target_row, i).value = v
