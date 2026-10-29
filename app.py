@@ -31,13 +31,78 @@ import re
 import json
 import tempfile
 import importlib
-import recommend_v5
 from functools import wraps
 
 import requests
 import base64 as base64_lib
 import threading
 import time
+
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+GITHUB_REPO = 'anisanaeem2994-bot/snatched-recommend-engine'
+GITHUB_FILE_PATH = 'snatched_beauty_box_master.xlsx'
+
+def _restore_from_github_on_boot():
+    """Runs once, BEFORE recommend_v5 (and therefore its workbook) is ever
+    imported. Without this, every fresh container boot -- which on Render's
+    free plan happens on literally every idle-spin-down-then-wake cycle, not
+    just a real redeploy -- loaded whichever .xlsx file happened to be baked
+    into the LAST DEPLOY, discarding every approve/manual-pick/edit made
+    since. push_to_github_async() below has always pushed a real, current
+    backup after every change, but nothing ever read that backup back in --
+    it just sat in GitHub, useful only if a human remembered to trigger a
+    fresh Render deploy afterward. This closes that loop: pull the latest
+    committed workbook from GitHub and overwrite the bundled file with it
+    BEFORE recommend_v5.py's own module-level code finds and loads it, so a
+    routine restart resumes from the real latest state instead of reverting
+    to stale deploy-time data. Failing closed on purpose -- any problem here
+    (no token, GitHub down, bad response) just leaves the bundled file as it
+    was, exactly like before this existed, rather than risking corrupting it.
+
+    Returns True only when the bundled file was actually overwritten with a
+    confirmed-good copy from GitHub, False in every other case (no token,
+    GitHub error, suspiciously small response, any exception). This return
+    value matters beyond just logging: _trim_workbook_padding_on_boot()
+    below only pushes its trimmed result back to GitHub when this returned
+    True, specifically to avoid a dangerous case -- if this restore failed
+    because GitHub has a real, newer backup we simply couldn't fetch right
+    now (a timeout, a 500, a rate limit), then the workbook we're actually
+    running on is the stale bundled one from the last deploy. Trimming and
+    then UNCONDITIONALLY pushing that stale copy back to GitHub would
+    silently overwrite the real, newer backup with old data -- exactly the
+    kind of data loss this whole restore-on-boot mechanism exists to
+    prevent. Skipping the push in that case leaves GitHub's real backup
+    alone; the local trim still happens either way for this process's own
+    save-speed benefit, it just doesn't get published anywhere."""
+    if not GITHUB_TOKEN:
+        print('WARNING: GITHUB_TOKEN not set at startup -- cannot restore latest backup from GitHub, starting from whatever workbook is bundled in this deploy.', flush=True)
+        return False
+    try:
+        target_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), GITHUB_FILE_PATH)
+        headers = {'Authorization': f'token {GITHUB_TOKEN}'}
+        get_url = f'https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}'
+        resp = requests.get(get_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f'WARNING: could not fetch latest workbook from GitHub at startup (HTTP {resp.status_code}) -- starting from whatever is bundled in this deploy instead.', flush=True)
+            return False
+        content_b64 = resp.json().get('content', '')
+        raw = base64_lib.b64decode(content_b64)
+        if len(raw) < 1000:
+            # A real .xlsx is a zip file -- it is never this small. Refuses to
+            # overwrite a real workbook with garbage from a bad/partial response.
+            print(f'WARNING: GitHub returned a suspiciously small workbook at startup ({len(raw)} bytes) -- keeping the bundled copy instead.', flush=True)
+            return False
+        with open(target_path, 'wb') as f:
+            f.write(raw)
+        print(f'Restored latest workbook from GitHub at startup ({len(raw)} bytes, {get_url}).', flush=True)
+        return True
+    except Exception as e:
+        print(f'WARNING: could not restore latest workbook from GitHub at startup: {e} -- starting from whatever is bundled in this deploy instead.', flush=True)
+        return False
+
+_boot_restore_from_github_succeeded = _restore_from_github_on_boot()
+
+import recommend_v5
 
 # Tracks the on-disk modified-time of the bundled workbook as of the last
 # real reload, so we only pay the cost of re-parsing the whole spreadsheet
@@ -90,9 +155,25 @@ def _force_reload_real_workbook():
     except (OSError, TypeError):
         _workbook_state['mtime'] = None
 
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
-GITHUB_REPO = 'anisanaeem2994-bot/snatched-recommend-engine'
-GITHUB_FILE_PATH = 'snatched_beauty_box_master.xlsx'
+def _save_workbook():
+    """Every write route calls this instead of calling
+    `recommend_v5.wb.save(recommend_v5.path)` directly. Saving to disk
+    changes the file's mtime -- and _reload_if_needed() used to have no way
+    to tell "the file changed because I just wrote it" apart from "the file
+    changed because something outside this process touched it", so it
+    triggered a full several-second reload (re-parsing the entire workbook
+    from scratch) on literally the very next request after ANY save. That
+    was the main reason the dashboard felt like it "did nothing" for 15-20
+    seconds after every single approve/pick. Updating our own cached mtime
+    at the exact moment we save tells the next request "nothing changed
+    since I last looked, no reload needed" -- a real reload still correctly
+    happens when the file changes for an actual external reason (a fresh
+    deploy, or the GitHub-restore-on-boot step at the top of this file)."""
+    recommend_v5.wb.save(recommend_v5.path)
+    try:
+        _workbook_state['mtime'] = os.path.getmtime(recommend_v5.path) if recommend_v5.path else None
+    except (OSError, TypeError):
+        pass
 
 # Tracks the health of the GitHub backup so the dashboard can show a clear
 # warning banner instead of a backup silently failing with nobody knowing.
@@ -178,6 +259,71 @@ def push_to_github_async():
     runs it on a background thread instead, so the response comes back
     immediately regardless of how long (or whether) GitHub cooperates."""
     threading.Thread(target=push_to_github, daemon=True).start()
+
+def _trim_workbook_padding_on_boot():
+    """One-time cleanup, run once per process boot (right here, after the
+    workbook is loaded/restored from GitHub, before any request is served):
+    several of this workbook's sheets carry hundreds of blank, merely-
+    formatted rows left over from before this was an app -- ws.max_row
+    reports up to 1000 while the real data stops at a small fraction of
+    that (confirmed on a real snapshot: customers real-to-row-27 vs
+    declared 1000, box_items real-to-row-880 vs declared 1000, inventory
+    real-to-row-569 vs declared 1000, etc). wb.save() re-serializes every
+    row up to max_row, blank or not, so this padding was a dominant cost of
+    every single save -- cutting it measured roughly 2x faster on a full
+    real snapshot, with zero formulas anywhere in this workbook and zero
+    cell-value differences on the real data in a full diff (confirmed
+    separately before this was wired in).
+
+    _append_row() (used everywhere this app now writes a new row, instead
+    of openpyxl's own ws.append()) already stops this padding from
+    regrowing -- but the padding that's ALREADY there needed removing once.
+    Doing that here, automatically at boot, instead of as a one-off manual
+    script someone has to remember to run, means it keeps applying to
+    whatever workbook is actually live -- including right after every
+    GitHub-restore-on-boot -- with no separate step for anyone to do. It's
+    safe to run every single boot: trimming an already-trimmed sheet finds
+    nothing past the real last row and does nothing.
+
+    If anything actually changed, saves it to disk either way (this
+    process's own saves get the speed benefit regardless). It only ALSO
+    pushes the trimmed copy to GitHub when _boot_restore_from_github_succeeded
+    is True -- i.e. when we know for certain the workbook we just trimmed
+    really is GitHub's current latest, not a stale fallback copy. See the
+    long comment on _restore_from_github_on_boot()'s return value for why
+    pushing an unconfirmed copy would be dangerous: it could silently
+    overwrite a real, newer GitHub backup with stale data."""
+    try:
+        wb = recommend_v5.wb
+        trimmed_any = False
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            old_max = ws.max_row
+            last = 1
+            for r in range(2, old_max + 1):
+                if any(c.value not in (None, '') for c in ws[r]):
+                    last = r
+            if old_max > last:
+                removed = old_max - last
+                ws.delete_rows(last + 1, removed)
+                print(f'Trimmed {removed} padding row(s) from sheet "{sheet_name}" '
+                      f'(max_row {old_max} -> {ws.max_row}).', flush=True)
+                trimmed_any = True
+        if trimmed_any:
+            _save_workbook()
+            if _boot_restore_from_github_succeeded:
+                push_to_github_async()
+                print('Workbook padding trim complete -- saved locally and pushed to GitHub.', flush=True)
+            else:
+                print('Workbook padding trim complete -- saved locally only (NOT pushed to GitHub, '
+                      'since the restore-from-GitHub step above did not confirm this is the current '
+                      'latest workbook -- pushing an unconfirmed copy could overwrite a newer real '
+                      'backup with stale data).', flush=True)
+    except Exception as e:
+        print(f'WARNING: workbook padding trim failed (non-fatal, dashboard still works '
+              f'off the untrimmed workbook): {e}', flush=True)
+
+_trim_workbook_padding_on_boot()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
@@ -513,7 +659,7 @@ def dashboard_set_customer_status():
                         ws_board.delete_rows(r, 1)
                     removed_from_board = True
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True, 'customer_id': customer_id, 'status': new_status,
@@ -585,7 +731,7 @@ def dashboard_resync_board():
         if rows_to_delete:
             for r in sorted(set(rows_to_delete), reverse=True):
                 ws_board.delete_rows(r, 1)
-            wb.save(recommend_v5.path)
+            _save_workbook()
             push_to_github_async()
 
         return jsonify({
@@ -652,7 +798,7 @@ def dashboard_cancel_box():
                 not_found.append(prod)
 
         box_row[4].value = 'Cancelled'
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True,
@@ -708,8 +854,8 @@ def dashboard_block_brand():
         # relying on it could silently record the wrong month depending on
         # what some unrelated earlier request last set it to.
         target_month = _datetime.now().strftime('%Y-%m')
-        ws.append([customer_id, brand, reason, target_month, customer_name])
-        recommend_v5.wb.save(recommend_v5.path)
+        _append_row(ws, [customer_id, brand, reason, target_month, customer_name])
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'brand': brand})
     except Exception as e:
@@ -739,7 +885,7 @@ def dashboard_unblock_brand():
         for r in rows_to_delete:
             ws.delete_rows(r, 1)
 
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'removed': len(rows_to_delete)})
     except Exception as e:
@@ -771,7 +917,7 @@ def dashboard_set_customer_notes():
         if not updated:
             return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'notes': notes})
     except Exception as e:
@@ -837,7 +983,7 @@ def dashboard_edit_customer():
         if not updated_fields:
             return jsonify({'error': 'No editable fields were sent.'}), 400
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'customer_id': customer_id, 'updated': updated_fields})
     except Exception as e:
@@ -884,7 +1030,7 @@ def dashboard_confirm_payment():
         today_str = _datetime.now().strftime('%Y-%m-%d')
         target_row[payment_col - 1].value = today_str
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True,
@@ -908,16 +1054,28 @@ def dashboard_create_customer():
 
     Only 'name' is required. Status defaults to Active unless told
     otherwise. subscribed_since defaults to today if not given, since a
-    brand-new signup is, by definition, subscribing as of right now."""
+    brand-new signup is, by definition, subscribing as of right now.
+
+    If a month is already being worked on (something's on the review
+    board) and she's Active, she's also immediately built a box and added
+    to that board -- otherwise "boxes to review this month" silently
+    stayed wrong until someone remembered to run a separate step for her.
+    board_added/board_message in the response say whether that part
+    worked; if it didn't (e.g. nothing eligible for her tier yet), the
+    customer is still created either way -- only the board step can fail."""
     try:
-        new_id, name, quiz_updated = _create_customer_core(request.form)
-        return jsonify({'success': True, 'customer_id': new_id, 'name': name, 'quiz_updated': quiz_updated})
+        new_id, name, quiz_updated, board_added, board_message = _create_customer_core(
+            request.form, auto_add_to_board=True)
+        return jsonify({
+            'success': True, 'customer_id': new_id, 'name': name, 'quiz_updated': quiz_updated,
+            'board_added': board_added, 'board_message': board_message,
+        })
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def _create_customer_core(form, mark_needs_review=False, review_reason=None):
+def _create_customer_core(form, mark_needs_review=False, review_reason=None, auto_add_to_board=False):
     """Shared core of dashboard_create_customer() and
     dashboard_confirm_subscription() -- generates the next CUSTOMER_ID,
     writes the new row, and fills in any quiz/frequency/preference
@@ -925,7 +1083,7 @@ def _create_customer_core(form, mark_needs_review=False, review_reason=None):
     dict-like with .get()/.items()/'in' support -- a real request.form,
     or a plain dict built from a parsed quiz/subscription email. Raises
     ValueError('name is required.') if name is missing. Returns
-    (new_id, name, quiz_updated).
+    (new_id, name, quiz_updated, board_added, board_message).
 
     mark_needs_review=True flags the new row so it shows up in Iqra's
     "needs review" list on Home -- used only when Make.com creates a
@@ -933,7 +1091,18 @@ def _create_customer_core(form, mark_needs_review=False, review_reason=None):
     short human-readable string stored in that column (shown to Iqra
     as-is), e.g. 'New from quiz' or 'New from payment -- no quiz on
     file'. A customer Iqra creates herself from the dashboard never gets
-    this -- she already knows what she just typed in."""
+    this -- she already knows what she just typed in.
+
+    auto_add_to_board=True (only set by the manual dashboard-create path,
+    never the Make.com-driven "needs review" ones above -- nobody's
+    confirmed those yet, so building a real box for one immediately would
+    be premature) also tries to build her a box and add her to whichever
+    month is currently on the working review board, if any, right after
+    she's created -- so she doesn't just silently sit off the board until
+    someone remembers a separate step. board_added is False and
+    board_message explains why if there's no board in progress yet, she's
+    not Active, or recommend() itself couldn't build her a box -- none of
+    which stop the customer record itself from being created."""
     name = (form.get('name') or '').strip()
     if not name:
         raise ValueError('name is required.')
@@ -997,9 +1166,31 @@ def _create_customer_core(form, mark_needs_review=False, review_reason=None):
 
     quiz_updated = _apply_preference_updates(wb, new_id, name, form)
 
-    wb.save(recommend_v5.path)
+    _save_workbook()
     push_to_github_async()
-    return new_id, name, quiz_updated
+
+    board_added = False
+    board_message = None
+    if auto_add_to_board:
+        status_val = str(form.get('status') or 'Active').strip().lower()
+        if status_val != 'active':
+            board_message = f'Not added to the board yet -- her status is "{form.get("status") or "Active"}", not Active.'
+        else:
+            try:
+                existing = _get_dash_sheet(create=False)
+                existing_blocks = _parse_dash_sheet(existing) if existing is not None else []
+                current_month = existing_blocks[0].get('month') if existing_blocks else None
+            except Exception as e:
+                current_month = None
+                board_message = f'Could not check the current board: {e}'
+            if current_month:
+                ok, result, _status_code = _add_customer_to_board_core(new_id, current_month)
+                board_added = ok
+                board_message = None if ok else result
+            elif board_message is None:
+                board_message = 'No month is currently on the review board yet -- she\'ll be included the next time one is generated.'
+
+    return new_id, name, quiz_updated, board_added, board_message
 
 def _apply_preference_updates(wb, customer_id, customer_name, form):
     """Shared core of dashboard_edit_preferences() -- writes quiz answers,
@@ -1362,7 +1553,7 @@ def dashboard_quiz_submission():
             if parsed.get('phone') and not existing_row[phone_col - 1].value:
                 existing_row[phone_col - 1].value = parsed['phone']
             quiz_updated = _apply_preference_updates(wb, customer_id, name, parsed)
-            wb.save(recommend_v5.path)
+            _save_workbook()
             push_to_github_async()
             return jsonify({
                 'success': True, 'created': False, 'staged': False, 'customer_id': customer_id,
@@ -1370,7 +1561,7 @@ def dashboard_quiz_submission():
             })
 
         _stage_quiz(parsed)
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True, 'created': False, 'staged': True,
@@ -1550,7 +1741,7 @@ def dashboard_confirm_subscription():
                 header_cell.value = 'last_payment_confirmed'
             today_str = _datetime.now().strftime('%Y-%m-%d')
             existing_row[payment_col - 1].value = today_str
-            wb.save(recommend_v5.path)
+            _save_workbook()
             push_to_github_async()
             return jsonify({
                 'success': True, 'created': False, 'action': 'payment_confirmed',
@@ -1582,7 +1773,7 @@ def dashboard_confirm_subscription():
             else:
                 review_reason = 'New from quiz + payment'
 
-            new_id, name, quiz_updated = _create_customer_core(
+            new_id, name, quiz_updated, _board_added, _board_message = _create_customer_core(
                 merged_form, mark_needs_review=True, review_reason=review_reason)
         else:
             # Paid without a quiz on file under this email. Don't lose
@@ -1593,7 +1784,7 @@ def dashboard_confirm_subscription():
             fallback_form = dict(sub_fields)
             fallback_form['name'] = parsed.get('name') or parsed['email'].split('@')[0]
             fallback_form['email'] = parsed['email']
-            new_id, name, quiz_updated = _create_customer_core(
+            new_id, name, quiz_updated, _board_added, _board_message = _create_customer_core(
                 fallback_form, mark_needs_review=True,
                 review_reason='New from payment -- no quiz on file')
 
@@ -1605,7 +1796,7 @@ def dashboard_confirm_subscription():
             if row[0].value == new_id:
                 row[CUSTOMER_EDITABLE_FIELDS['last_payment_confirmed'] - 1].value = today_str
                 break
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True, 'created': True, 'action': 'created',
@@ -1639,7 +1830,7 @@ def dashboard_mark_reviewed():
         if not target_row:
             return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
         target_row[NEEDS_REVIEW_COL - 1].value = ''
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'customer_id': customer_id})
     except Exception as e:
@@ -1670,7 +1861,7 @@ def dashboard_edit_preferences():
         if not updated:
             return jsonify({'error': 'No preference fields were sent.'}), 400
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'customer_id': customer_id, 'updated': updated})
     except Exception as e:
@@ -1767,7 +1958,7 @@ def approve_item_endpoint():
         if not updated:
             return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
 
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
     except Exception as e:
@@ -1809,7 +2000,7 @@ def unapprove_item_endpoint():
         if not updated:
             return jsonify({'error': f'Product "{product_name}" not found in inventory.'}), 400
 
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'product': product_name, 'stock_before': old_stock, 'stock_after': new_stock})
     except Exception as e:
@@ -2097,11 +2288,16 @@ def finalize_item_endpoint():
     try:
         _reload_if_needed()
         ws_items = recommend_v5.wb['box_items']
-        next_item_num = ws_items.max_row
-        next_item_num += 1
-        ws_items.append([f'BI{next_item_num:05d}', customer_name, customer_id, target_month, box_type, box_id, product_name])
+        # Was ws_items.max_row + 1 -- box_items carries blank formatted rows
+        # past the real last one, so that always landed hundreds of rows
+        # below the real data (and pushed max_row out even further every
+        # time). _max_id_suffix scans the real IDs instead, same as
+        # commit_month already does; _append_row writes at the real next
+        # row instead of ws.append()'s max_row + 1.
+        next_item_num = _max_id_suffix(ws_items, 1, 'BI') + 1
+        _append_row(ws_items, [f'BI{next_item_num:05d}', customer_name, customer_id, target_month, box_type, box_id, product_name])
 
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'item_added': product_name, 'box_id': box_id})
     except Exception as e:
@@ -2124,11 +2320,13 @@ def create_box_record_endpoint():
     try:
         _reload_if_needed()
         ws_boxes = recommend_v5.wb['boxes']
-        next_box_num = ws_boxes.max_row + 1
+        # Was ws_boxes.max_row + 1 -- see the matching comment in
+        # finalize_item_endpoint just above; same fix, same reason.
+        next_box_num = _max_id_suffix(ws_boxes, 1, 'BOX') + 1
         box_id = f'BOX{next_box_num:04d}'
-        ws_boxes.append([box_id, customer_id, customer_name, target_month, 'sent', box_type])
+        _append_row(ws_boxes, [box_id, customer_id, customer_name, target_month, 'sent', box_type])
 
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'box_id': box_id})
     except Exception as e:
@@ -2351,7 +2549,7 @@ def dashboard_generate_month():
                            why_text, 'Pending', False, p.get('retail_price_aed')])
             built += 1
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True, 'target_month': target_month, 'customers_built': built,
@@ -2360,21 +2558,16 @@ def dashboard_generate_month():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/dashboard/generate_for_customer', methods=['POST'])
-@dashboard_login_required
-def dashboard_generate_for_customer():
-    """Builds a box for exactly ONE customer and adds her to the working
-    board, without touching anyone else already there or re-building
-    anyone whose box for this month is already committed. For the exact
-    case of a customer who was skipped from the normal month generation
-    (e.g. her tier wasn't confirmed yet) -- once she confirms, use this
-    to add just her, any time, even after the rest of the month has
-    already been committed."""
-    customer_id = request.form.get('customer_id')
-    target_month = request.form.get('target_month')
-    if not customer_id or not target_month:
-        return jsonify({'error': 'customer_id and target_month are required.'}), 400
-
+def _add_customer_to_board_core(customer_id, target_month):
+    """Shared core of dashboard_generate_for_customer() and the
+    auto-add-to-this-month's-board step _create_customer_core() runs for a
+    brand-new customer Iqra adds herself mid-month. Builds a box for exactly
+    ONE customer and appends her onto the working board for target_month,
+    without touching anyone else already there. Never raises -- returns
+    (success, message, status_code): on success `message` is her name, on
+    failure it's a human-readable reason (already has a committed box,
+    already on the board, or recommend() itself couldn't build her a box --
+    e.g. no eligible products for her tier yet)."""
     try:
         _reload_if_needed()
         wb = recommend_v5.wb
@@ -2382,19 +2575,19 @@ def dashboard_generate_for_customer():
         customers = recommend_v5.load_customers()
         cust = customers.get(customer_id)
         if not cust:
-            return jsonify({'error': f'No customer found with id "{customer_id}".'}), 404
+            return False, f'No customer found with id "{customer_id}".', 404
 
         # Refuse if she already has a real, committed box for this exact
-        # month -- the #1 thing this endpoint exists to prevent.
+        # month -- the #1 thing this is meant to prevent.
         ws_boxes = wb['boxes']
         for row in ws_boxes.iter_rows(min_row=2, values_only=True):
             if row[1] == customer_id and str(row[3]) == target_month and str(row[4]).strip().lower() != 'cancelled':
-                return jsonify({'error': f'{cust["name"]} already has a committed box for {target_month} ({row[0]}).'}), 409
+                return False, f'{cust["name"]} already has a committed box for {target_month} ({row[0]}).', 409
 
         existing = _get_dash_sheet(create=False)
         existing_blocks = _parse_dash_sheet(existing) if existing is not None else []
         if any(b['customer_id'] == customer_id and b.get('month') == target_month for b in existing_blocks):
-            return jsonify({'error': f'{cust["name"]} is already on the board for {target_month}.'}), 409
+            return False, f'{cust["name"]} is already on the board for {target_month}.', 409
 
         recommend_v5.set_target_month(target_month)
         recommend_v5.reset_allocations()
@@ -2406,7 +2599,7 @@ def dashboard_generate_for_customer():
 
         out = recommend_v5.recommend(cust['name'])
         if isinstance(out, str):
-            return jsonify({'error': out}), 400
+            return False, out, 400
         (c, picks, warnings, received, ratio, recent, hard_block, soft_avoid,
          hist_pat, total, timeline, inv_cat_map, value_summary) = out
 
@@ -2433,11 +2626,31 @@ def dashboard_generate_for_customer():
             ws.append([i, p['name'], p['category'], p['tier'], p['stock'],
                        why_text, 'Pending', False, p.get('retail_price_aed')])
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
-        return jsonify({'success': True, 'customer_name': c['name'], 'target_month': target_month})
+        return True, c['name'], 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return False, str(e), 500
+
+@app.route('/dashboard/generate_for_customer', methods=['POST'])
+@dashboard_login_required
+def dashboard_generate_for_customer():
+    """Builds a box for exactly ONE customer and adds her to the working
+    board, without touching anyone else already there or re-building
+    anyone whose box for this month is already committed. For the exact
+    case of a customer who was skipped from the normal month generation
+    (e.g. her tier wasn't confirmed yet) -- once she confirms, use this
+    to add just her, any time, even after the rest of the month has
+    already been committed."""
+    customer_id = request.form.get('customer_id')
+    target_month = request.form.get('target_month')
+    if not customer_id or not target_month:
+        return jsonify({'error': 'customer_id and target_month are required.'}), 400
+
+    ok, message, status_code = _add_customer_to_board_core(customer_id, target_month)
+    if not ok:
+        return jsonify({'error': message}), status_code
+    return jsonify({'success': True, 'customer_name': message, 'target_month': target_month})
 
 @app.route('/dashboard/state', methods=['GET'])
 @dashboard_login_required
@@ -2774,7 +2987,7 @@ def dashboard_edit_inventory_item():
         if not updated:
             return jsonify({'error': 'No editable fields were sent.'}), 400
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'product_id': product_id, 'updated': updated})
     except Exception as e:
@@ -2817,7 +3030,7 @@ def dashboard_delete_inventory_item():
         deleted_name = ws.cell(target_row, n_col).value
         ws.delete_rows(target_row, 1)
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True, 'product_id': product_id, 'name': deleted_name})
     except Exception as e:
@@ -2851,7 +3064,7 @@ def dashboard_add_inventory():
         wb = recommend_v5.wb
         ws = wb['inventory']
         result = _apply_inventory_change(wb, ws, name, qty, category, tier, price_raw)
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify(result)
     except Exception as e:
@@ -3132,7 +3345,7 @@ def dashboard_bulk_add_inventory():
                 restocked.append(result)
 
         if any_applied:
-            wb.save(recommend_v5.path)
+            _save_workbook()
             push_to_github_async()
 
         return jsonify({
@@ -3163,6 +3376,32 @@ def _next_append_row(ws, check_cols=(1, 2)):
         if any(ws.cell(r, c).value not in (None, '') for c in check_cols):
             last = r
     return last + 1
+
+def _append_row(ws, values):
+    """Writes `values` as a brand-new row -- everywhere this workbook used
+    to call openpyxl's own ws.append() directly. ws.append() always inserts
+    at ws.max_row + 1, which is exactly wrong on a sheet that has blank,
+    merely-formatted trailing rows left over from before this app existed
+    (some sheets report ws.max_row in the thousands while the real data
+    stops at a tiny fraction of that) -- it would silently leave a huge gap
+    of blank rows, AND permanently push ws.max_row out even further, which
+    compounds every time this runs (every month committed, every brand
+    blocked, etc.). That compounding growth is what made saving the whole
+    workbook (which writes out every row up to ws.max_row, blank or not)
+    get slower over time -- fixing just the immediate cause once wasn't
+    enough, since every one of these call sites would have started quietly
+    re-inflating it again on the very next use. Mirrors _next_append_row()'s
+    real-last-row scan, but checks every column instead of only a couple,
+    since callers here don't all agree on which columns matter. Returns the
+    row number actually written to."""
+    last = 1
+    for r in range(2, ws.max_row + 1):
+        if any(c.value not in (None, '') for c in ws[r]):
+            last = r
+    target_row = last + 1
+    for i, v in enumerate(values, start=1):
+        ws.cell(target_row, i).value = v
+    return target_row
 
 def _restock_product_by_name(wb, product_name):
     """Puts one unit of a product back into inventory by name. Used
@@ -3231,7 +3470,7 @@ def dashboard_swap():
 
         _write_item_row(ws, row_number, product,
                          'Owner-requested swap — next best match for her preferences, timing, and brand rules.')
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
         return jsonify({'found': True, 'item': updated})
@@ -3273,7 +3512,7 @@ def dashboard_swap_category():
 
         _write_item_row(ws, row_number, product,
                          f'Owner-requested category change — swapped from "{old_category}" to "{new_category}".')
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         updated = next(i for i in _find_item_row_context(ws, row_number)[0]['items'] if i['row_number'] == row_number)
         return jsonify({'found': True, 'item': updated, 'old_category': old_category, 'new_category': new_category})
@@ -3404,7 +3643,7 @@ def dashboard_manual_pick():
         _write_item_row(ws, row_number, product,
                          'Owner-selected manually — chosen directly instead of an engine suggestion.',
                          manual=True)
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
 
         # Since she can now manually pick from any tier/category, a box can
@@ -3483,7 +3722,7 @@ def dashboard_approve():
             return jsonify({'error': f'Product "{item["name"]}" not found in inventory.'}), 400
 
         ws.cell(row_number, 7).value = 'Approved'
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True})
     except Exception as e:
@@ -3517,7 +3756,7 @@ def dashboard_unapprove():
                 break
 
         ws.cell(row_number, 7).value = 'Pending'
-        recommend_v5.wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({'success': True})
     except Exception as e:
@@ -3583,11 +3822,17 @@ def dashboard_commit_month():
 
             next_box_num += 1
             box_id = f'BOX{next_box_num:04d}'
-            ws_boxes.append([box_id, b['customer_id'], b['customer_name'], target_month, 'sent', b['box_type']])
+            # Was ws_boxes.append(...)/ws_items.append(...) -- same fix as
+            # /create_box_record and /finalize_item above: raw .append() on
+            # these padded sheets inserts far past the real data and grows
+            # max_row every time, which is exactly the lag problem recurring
+            # every single month this endpoint runs. _append_row() finds the
+            # true last real row and writes there instead.
+            _append_row(ws_boxes, [box_id, b['customer_id'], b['customer_name'], target_month, 'sent', b['box_type']])
             for it in b['items']:
                 next_item_num += 1
-                ws_items.append([f'BI{next_item_num:05d}', b['customer_name'], b['customer_id'],
-                                  target_month, b['box_type'], box_id, it['name']])
+                _append_row(ws_items, [f'BI{next_item_num:05d}', b['customer_name'], b['customer_id'],
+                                        target_month, b['box_type'], box_id, it['name']])
 
             committed.append(b['customer_name'])
             rows_to_delete.append(b['header_row'])
@@ -3596,7 +3841,7 @@ def dashboard_commit_month():
         for r in sorted(rows_to_delete, reverse=True):
             ws.delete_rows(r, 1)
 
-        wb.save(recommend_v5.path)
+        _save_workbook()
         push_to_github_async()
         return jsonify({
             'success': True,

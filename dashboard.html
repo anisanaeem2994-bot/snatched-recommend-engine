@@ -103,6 +103,7 @@
   .cust-card{ background:var(--card); border-radius:var(--radius); box-shadow:var(--shadow); margin-bottom:16px; overflow:hidden; }
   .cust-head{ padding:16px 20px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; background:linear-gradient(135deg,#fbf2f6,#f5f2fb); }
   .cust-name{ font-weight:700; font-size:15.5px; }
+  .cust-number{ color:var(--muted); font-weight:700; margin-right:2px; }
   .cust-meta{ font-size:12.5px; color:var(--muted); margin-top:2px; }
   .tier-badge{ font-size:11px; font-weight:700; padding:4px 10px; border-radius:999px; background:var(--purple); color:#fff; }
   .box-total{ font-size:13px; font-weight:700; }
@@ -143,6 +144,7 @@
   .big-search .icon{ position:absolute; left:16px; top:50%; transform:translateY(-50%); color:var(--muted); }
   .suggest-row{ display:flex; gap:8px; justify-content:center; margin-top:12px; flex-wrap:wrap; }
   .suggest-chip{ background:var(--card); border:1px solid var(--line); padding:6px 14px; border-radius:999px; font-size:12.5px; cursor:pointer; }
+  .suggest-chip-num{ color:var(--muted); font-weight:700; }
   .suggest-chip:hover{ background:var(--peach); }
   .status-filter-btn{ background:var(--card); border:1px solid var(--line); padding:5px 13px; border-radius:999px; font-size:12.5px; cursor:pointer; color:var(--muted); }
   .status-filter-btn:hover{ background:var(--peach); }
@@ -279,6 +281,7 @@
       <div class="stat-card" onclick="showPage('review')">
         <div class="stat-num" id="homeReviewCount">—</div>
         <div class="stat-label">boxes to review this month</div>
+        <div class="stat-sublabel" style="font-size:10.5px;color:var(--muted);margin-top:2px;">everyone currently on the board — may include some of the "new" customers below too</div>
       </div>
       <div class="stat-card purple" onclick="showPage('review')">
         <div class="stat-num" id="homeApprovedCount">—</div>
@@ -296,9 +299,10 @@
         <div class="stat-num" id="homeBirthdayCount">—</div>
         <div class="stat-label">birthday this month</div>
       </div>
-      <div class="stat-card purple" onclick="showPage('customers')">
+      <div class="stat-card purple" onclick="showNewCustomersOnly()">
         <div class="stat-num" id="homeNewCustomerCount">—</div>
         <div class="stat-label">new customer this month</div>
+        <div class="stat-sublabel" style="font-size:10.5px;color:var(--muted);margin-top:2px;">signed up this calendar month — not a separate count from "boxes to review," she can be in both</div>
       </div>
     </div>
 
@@ -447,8 +451,10 @@
         <button type="button" class="status-filter-btn" data-status="Paused" onclick="setCustStatusFilter('Paused')">Paused</button>
         <button type="button" class="status-filter-btn" data-status="Cancelled" onclick="setCustStatusFilter('Cancelled')">Cancelled</button>
         <button type="button" class="status-filter-btn" data-status="All" onclick="setCustStatusFilter('All')">All</button>
+        <button type="button" class="status-filter-btn" data-status="New" onclick="setCustStatusFilter('New')">New this month</button>
         <button type="button" class="btn btn-swap" style="margin-left:auto;" onclick="openNewCustomerForm()">+ Add new customer</button>
       </div>
+      <div id="suggestCount" style="font-size:13px;font-weight:700;color:var(--muted);margin:2px 0 2px;text-align:center;"></div>
       <div class="suggest-row" id="suggestRow"></div>
       <div id="newCustomerFormArea"></div>
     </div>
@@ -467,7 +473,8 @@ let allCustomersList = null;  // from /dashboard/all_customers — every custome
                                // not just whoever's on the currently loaded month's board
 let inventoryCatalog = null;  // fetched lazily on first manual-search use
 let currentMonth = null;
-let custStatusFilter = 'Active';  // which customers the search/suggest list shows: Active (default), Cancelled, or All
+let custStatusFilter = 'Active';  // which customers the search/suggest list shows: Active (default), Paused, Cancelled, All, or New
+let newCustomersThisMonth = [];  // from /dashboard/home_stats's new_customers -- the exact set the "New Customers" home stat counts, kept here so clicking it can filter down to just these instead of showing every active customer
 
 async function ensureAllCustomers(){
   if(allCustomersList) return allCustomersList;
@@ -590,6 +597,7 @@ async function loadHomeStats(){
   }
 
   const newCustomers = data.new_customers || [];
+  newCustomersThisMonth = newCustomers;
   document.getElementById('homeNewCustomerCount').textContent = newCustomers.length;
   const ncPanel = document.getElementById('newCustomersPanel');
   const ncList = document.getElementById('newCustomersList');
@@ -663,11 +671,33 @@ function rowKey(rowNumber){ return 'row-'+rowNumber; }
 function renderReview(){
   const wrap = document.getElementById('custList');
   const emptyNote = document.getElementById('reviewEmptyNote');
+
+  // renderReview() rebuilds the ENTIRE board from scratch on every single
+  // action -- not just the row that changed, but every other customer's
+  // cards too -- because loadBoard() (which calls this) runs after literally
+  // any approve/swap/pick anywhere on the board. If she had a manual "enter
+  // my own" panel open on a DIFFERENT row (browsing, or mid-way through
+  // typing a filter) when some OTHER row's action finished loading in the
+  // background, the old code silently closed that panel and threw away
+  // whatever she'd typed the moment this ran -- "it removes what I was
+  // doing with the second task". Snapshotting it here and restoring it
+  // after the rebuild below fixes that without having to stop rebuilding
+  // the whole board (which would be a much bigger change).
+  let reopenRowKey = null, reopenFilterValue = '';
+  if(openManualRowKey){
+    const prevPanel = document.getElementById('manual-'+openManualRowKey);
+    if(prevPanel && prevPanel.classList.contains('open')){
+      reopenRowKey = openManualRowKey;
+      const prevInput = prevPanel.querySelector('input');
+      if(prevInput) reopenFilterValue = prevInput.value;
+    }
+  }
+
   wrap.innerHTML = '';
   emptyNote.style.display = boardCustomers.length ? 'none' : 'block';
 
   let approvedTotal = 0;
-  boardCustomers.forEach(cust=>{
+  boardCustomers.forEach((cust, custIdx)=>{
     const approvedHere = cust.items.filter(i=>i.status==='Approved').length;
     if(approvedHere === cust.items.length && cust.items.length) approvedTotal += 1;
 
@@ -678,7 +708,7 @@ function renderReview(){
     card.innerHTML = `
       <div class="cust-head">
         <div>
-          <div class="cust-name">${cust.customer_name} <span class="tier-badge">${(cust.box_type||'').split('(')[0].trim()}</span></div>
+          <div class="cust-name"><span class="cust-number" title="Box ${custIdx+1} of ${boardCustomers.length}">${custIdx+1}.</span> ${cust.customer_name} <span class="tier-badge">${(cust.box_type||'').split('(')[0].trim()}</span></div>
           <button class="history-link" onclick="openDrawer('${cust.customer_name.replace(/'/g,"\\'")}')" style="margin-top:8px;">🔎 View her history — without leaving this page</button>
         </div>
         <div style="text-align:right">
@@ -697,6 +727,40 @@ function renderReview(){
   const commitBtn = document.getElementById('commitBtn');
   if(totalCustomers && approvedTotal === totalCustomers){ commitBtn.classList.add('ready'); commitBtn.textContent = 'Commit Month →'; }
   else { commitBtn.classList.remove('ready'); commitBtn.textContent = `Commit Month (${approvedTotal}/${totalCustomers} ready)`; }
+
+  if(reopenRowKey){
+    const stillExists = boardCustomers.some(c=>c.items.some(i=>rowKey(i.row_number)===reopenRowKey));
+    const panel = document.getElementById('manual-'+reopenRowKey);
+    if(stillExists && panel){
+      panel.classList.add('open');
+      const rowNumber = parseInt(reopenRowKey.replace('row-',''), 10);
+      if(manualCatalogCache[reopenRowKey]){
+        // Already have her eligible-products list cached from before this
+        // rebuild -- redraw instantly from it instead of re-fetching, so
+        // this doesn't introduce its own extra lag on top of fixing the loss.
+        const infoEl = document.getElementById('manualInfo-'+reopenRowKey);
+        const cached = manualCatalogCache[reopenRowKey];
+        if(infoEl){
+          infoEl.innerHTML = `📋 <b>${cached.total} products</b> — the full catalog, any category or tier (her usual tier is <b>${cached.box_type||'—'}</b>; anything else is just tagged below, not hidden) · ` +
+            (cached.blocked_count
+              ? `<span style="color:var(--red);font-weight:700;">${cached.blocked_count} flagged below — she doesn't want that brand.</span>`
+              : `<b>0 excluded</b> — no brands blocked for her right now.`);
+        }
+        const inp = panel.querySelector('input');
+        if(inp) inp.value = reopenFilterValue;
+        renderManualList(rowNumber, reopenFilterValue);
+      } else {
+        loadManualCatalog(rowNumber).then(()=>{
+          const inp = panel.querySelector('input');
+          if(inp) inp.value = reopenFilterValue;
+          if(reopenFilterValue) filterManualList(rowNumber, reopenFilterValue);
+        });
+      }
+    } else {
+      openManualRowKey = null;  // that row is gone (swapped/approved away) -- nothing to reopen
+    }
+  }
+
   renderHome();
 }
 
@@ -1215,6 +1279,28 @@ function filterManualList(rowNumber, val){
   renderManualList(rowNumber, val);
 }
 
+// Keeps a just-picked-from catalog's "currently in box" tags correct WITHOUT
+// re-fetching /dashboard/eligible_products (a ~100KB response that rebuilds
+// the entire catalog server-side) just to move one tag -- this used to run
+// on literally every single manual pick, and was the single biggest reason
+// "selecting own product is so slow". boardCustomers (just refreshed by
+// loadBoard(), which still has to run anyway) already has the exact same
+// information the server would have told us -- which product names are
+// currently in this customer's box -- so this recomputes the same `in_box`
+// flag the server computes, locally, from data already in memory. Returns
+// false (caller should fall back to a real refetch) only if nothing is
+// cached yet for this row, which shouldn't happen on a pick made from an
+// already-open, already-loaded panel.
+function patchManualCatalogInBox(rowNumber){
+  const rk = rowKey(rowNumber);
+  const cached = manualCatalogCache[rk];
+  const cust = boardCustomers.find(c => c.items.some(i => i.row_number === rowNumber));
+  if(!cached || !cust) return false;
+  const currentNamesLower = new Set(cust.items.map(i => (i.name||'').trim().toLowerCase()));
+  cached.items.forEach(p => { p.in_box = currentNamesLower.has((p.name||'').trim().toLowerCase()); });
+  return true;
+}
+
 async function selectManual(rowNumber, productName){
   const rk = rowKey(rowNumber);
   openManualRowKey = rk;
@@ -1227,7 +1313,16 @@ async function selectManual(rowNumber, productName){
       const panel = document.getElementById('manual-'+rk);
       if(panel) panel.classList.add('open');
       openManualRowKey = rk;
-      await loadManualCatalog(rowNumber); // refresh so "currently in box" tag moves to the new pick
+      // Was: await loadManualCatalog(rowNumber) -- a full re-fetch of the
+      // whole catalog just to move the "currently in box" tag. Patches the
+      // cache locally instead; only falls back to a real refetch if there's
+      // nothing cached to patch.
+      const curFilter = document.querySelector(`#manual-${rk} input`)?.value || '';
+      if(patchManualCatalogInBox(rowNumber)){
+        renderManualList(rowNumber, curFilter);
+      } else {
+        await loadManualCatalog(rowNumber);
+      }
       const warnEl = document.getElementById('manualWarn-'+rk);
       const okEl = document.getElementById('manualOk-'+rk);
       let msgs = [];
@@ -1286,14 +1381,29 @@ function setCustStatusFilter(status){
   });
   filterSuggest(document.getElementById('custSearch').value || '');
 }
+// Called from the "New Customers" home stat card -- it used to just open the
+// general Customers tab (showPage('customers')), which shows the full Active
+// list, not just the new ones, because nothing ever set the filter to
+// anything but whatever it already was. This sets a dedicated 'New' filter
+// so clicking that specific stat actually shows only the customers it's
+// counting, instead of everyone.
+function showNewCustomersOnly(){
+  showPage('customers');
+  document.getElementById('custSearch').value = '';
+  setCustStatusFilter('New');
+}
 async function filterSuggest(val){
   const row = document.getElementById('suggestRow');
   const all = await ensureAllCustomers();
   // "Active" means not explicitly Paused or Cancelled (older records with a
   // blank/other status still show up as active, same as
-  // recommend_v5.is_customer_due does).
+  // recommend_v5.is_customer_due does). "New" is its own thing -- not a
+  // status at all, just "is she in the exact set the New Customers stat
+  // on Home just counted" (subscribed this calendar month).
   const byStatus = custStatusFilter === 'All'
     ? all
+    : custStatusFilter === 'New'
+    ? all.filter(c => newCustomersThisMonth.some(n => n.id === c.id))
     : all.filter(c=>{
         const s = String(c.status||'').trim().toLowerCase();
         if(custStatusFilter === 'Cancelled') return s === 'cancelled';
@@ -1302,7 +1412,19 @@ async function filterSuggest(val){
       });
   const names = byStatus.map(c=>c.name);
   const matches = val ? names.filter(n=>n.toLowerCase().includes(val.toLowerCase())) : names;
-  row.innerHTML = matches.map(n=>`<span class="suggest-chip" onclick="goSearch('${n.replace(/'/g,"\\'")}')">${n}</span>`).join('')
+
+  // The actual ask behind "it should be numbered" -- she has to count these
+  // chips by hand to know how many Active/Paused/Cancelled customers there
+  // are. A running number on each chip, plus a plain count line above the
+  // whole list, means she never has to count anything herself again.
+  const countNoun = custStatusFilter === 'New'
+    ? (n => `new customer${n===1?'':'s'} this month`)
+    : (n => `${custStatusFilter === 'All' ? '' : custStatusFilter.toLowerCase()+' '}customer${n===1?'':'s'}`);
+  document.getElementById('suggestCount').textContent = val
+    ? `${matches.length} of ${byStatus.length} ${countNoun(byStatus.length)} match "${val}"`
+    : `${byStatus.length} ${countNoun(byStatus.length)}`;
+
+  row.innerHTML = matches.map((n,i)=>`<span class="suggest-chip" onclick="goSearch('${n.replace(/'/g,"\\'")}')"><span class="suggest-chip-num">${i+1}.</span> ${n}</span>`).join('')
     || `<span class="suggest-chip" style="opacity:.5">no ${custStatusFilter==='All'?'':custStatusFilter.toLowerCase()+' '}customer found${val?' with that name':''}</span>`;
 }
 
@@ -1480,10 +1602,14 @@ async function createNewCustomer(){
     const data = await postForm('/dashboard/create_customer', payload);
     if(!data || data.error){ alert('Could not create customer: ' + ((data && data.error) || 'unknown error')); return; }
     allCustomersList = null;  // force a fresh fetch so she shows up in the search right away
-    document.getElementById('newCustomerFormArea').innerHTML = `<div class="empty-note" style="color:var(--green);font-weight:700;">✔ ${data.name} created (${data.customer_id}).</div>`;
+    const boardNote = data.board_added
+      ? `<div style="margin-top:4px;">📋 Added to this month's review board too.</div>`
+      : (data.board_message ? `<div style="margin-top:4px;color:var(--muted);">ℹ️ ${data.board_message}</div>` : '');
+    document.getElementById('newCustomerFormArea').innerHTML = `<div class="empty-note" style="color:var(--green);font-weight:700;">✔ ${data.name} created (${data.customer_id}).${boardNote}</div>`;
     document.getElementById('custSearch').value = '';
     await filterSuggest('');
     goSearch(data.name);
+    if(data.board_added) await loadBoard();  // so "boxes to review this month" updates immediately, not just the next time anything else triggers a refresh
   }catch(e){ alert('Could not create customer: ' + e.message); }
 }
 
