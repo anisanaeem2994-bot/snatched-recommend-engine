@@ -305,8 +305,17 @@ def load_inventory():
     for r in ws.iter_rows(min_row=2, values_only=True):
         if not r[0]: continue
         inv.append({
-            'id': r[0], 'name': r[1], 'tier': r[2],
-            'category': r[3], 'stock': r[4] or 0,
+            # name/tier/category normalized to '' instead of None here --
+            # the single place every product dict gets built from raw sheet
+            # cells, so one bad/blank cell (e.g. a hand-added product from
+            # bulk-upload that never got a category typed in) can't crash
+            # every .lower()/`in` check done on these fields throughout
+            # scoring, swapping, and matching (score_product() and others
+            # assume these are always strings, never None). A genuinely
+            # uncategorized product just scores as "no category match"
+            # instead of taking down the whole request for every customer.
+            'id': r[0], 'name': r[1] or '', 'tier': r[2] or '',
+            'category': r[3] or '', 'stock': r[4] or 0,
             'cost_price': r[5] if len(r) > 5 else None,
             'retail_price_aed': r[6] if len(r) > 6 else None,
             'price_source': r[7] if len(r) > 7 else None,
