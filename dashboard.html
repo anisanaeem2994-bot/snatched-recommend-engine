@@ -301,8 +301,13 @@
       </div>
       <div class="stat-card purple" onclick="showNewCustomersOnly()">
         <div class="stat-num" id="homeNewCustomerCount">—</div>
-        <div class="stat-label">new customer this month</div>
-        <div class="stat-sublabel" style="font-size:10.5px;color:var(--muted);margin-top:2px;">signed up this calendar month — not a separate count from "boxes to review," she can be in both</div>
+        <div class="stat-label">new customers — this month's box</div>
+        <div class="stat-sublabel" style="font-size:10.5px;color:var(--muted);margin-top:2px;">signed up by the 19th (or rolled forward from last month) — not a separate count from "boxes to review," she can be in both</div>
+      </div>
+      <div class="stat-card purple" onclick="showNewCustomersNextMonthOnly()">
+        <div class="stat-num" id="homeNewCustomerNextMonthCount">—</div>
+        <div class="stat-label">new customers — next month's box</div>
+        <div class="stat-sublabel" style="font-size:10.5px;color:var(--muted);margin-top:2px;">signed up the 20th or later — too late for this month's box, queued for next cycle</div>
       </div>
     </div>
 
@@ -317,8 +322,15 @@
     </div>
 
     <div class="panel" id="newCustomersPanel" style="display:none;">
-      <h3>🆕 New customers this month</h3>
+      <h3>🆕 New customers — this month's box</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px;">Signed up on or before the 19th (or signed up last month on/after the 20th and rolled forward) — due in the box currently being reviewed.</div>
       <div id="newCustomersList"></div>
+    </div>
+
+    <div class="panel" id="newCustomersNextMonthPanel" style="display:none;">
+      <h3>🆕 New customers — next month's box</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px;">Signed up on or after the 20th this month — too late for this month's box, she'll first appear next cycle.</div>
+      <div id="newCustomersNextMonthList"></div>
     </div>
 
     <div class="panel" id="birthdaysPanel" style="display:none;">
@@ -451,7 +463,8 @@
         <button type="button" class="status-filter-btn" data-status="Paused" onclick="setCustStatusFilter('Paused')">Paused</button>
         <button type="button" class="status-filter-btn" data-status="Cancelled" onclick="setCustStatusFilter('Cancelled')">Cancelled</button>
         <button type="button" class="status-filter-btn" data-status="All" onclick="setCustStatusFilter('All')">All</button>
-        <button type="button" class="status-filter-btn" data-status="New" onclick="setCustStatusFilter('New')">New this month</button>
+        <button type="button" class="status-filter-btn" data-status="New" onclick="setCustStatusFilter('New')">New — this month's box</button>
+        <button type="button" class="status-filter-btn" data-status="NewNextMonth" onclick="setCustStatusFilter('NewNextMonth')">New — next month's box</button>
         <button type="button" class="btn btn-swap" style="margin-left:auto;" onclick="openNewCustomerForm()">+ Add new customer</button>
       </div>
       <div id="suggestCount" style="font-size:13px;font-weight:700;color:var(--muted);margin:2px 0 2px;text-align:center;"></div>
@@ -475,6 +488,7 @@ let inventoryCatalog = null;  // fetched lazily on first manual-search use
 let currentMonth = null;
 let custStatusFilter = 'Active';  // which customers the search/suggest list shows: Active (default), Paused, Cancelled, All, or New
 let newCustomersThisMonth = [];  // from /dashboard/home_stats's new_customers -- the exact set the "New Customers" home stat counts, kept here so clicking it can filter down to just these instead of showing every active customer
+let newCustomersNextMonth = []; // from /dashboard/home_stats's new_customers_next_month -- same idea, for the "queued for next month's box" bucket
 
 async function ensureAllCustomers(){
   if(allCustomersList) return allCustomersList;
@@ -608,6 +622,27 @@ async function loadHomeStats(){
     `).join('');
   } else {
     ncPanel.style.display = 'none';
+  }
+
+  // Second bucket -- same idea, but for signups already on file that are
+  // too late (20th+) for THIS month's box and are queued for next cycle
+  // instead. Both buckets are recomputed fresh off today's real date on
+  // every load (see /dashboard/home_stats), so which customer lands in
+  // which list shifts on its own as the calendar rolls over -- nothing
+  // here is pinned to a specific month, so there's nothing to manually
+  // clear out or reset at month's end.
+  const newCustomersNext = data.new_customers_next_month || [];
+  newCustomersNextMonth = newCustomersNext;
+  document.getElementById('homeNewCustomerNextMonthCount').textContent = newCustomersNext.length;
+  const ncnPanel = document.getElementById('newCustomersNextMonthPanel');
+  const ncnList = document.getElementById('newCustomersNextMonthList');
+  if(newCustomersNext.length){
+    ncnPanel.style.display = '';
+    ncnList.innerHTML = newCustomersNext.map(c => `
+      <div class="row-line"><span onclick="goSearch('${c.name.replace(/'/g,"\\'")}')" style="cursor:pointer;text-decoration:underline;">${c.name}</span><span class="pill ${String(c.status||'').toLowerCase()==='active'?'green':'amber'}">since ${c.subscribed_since || '—'}</span></div>
+    `).join('');
+  } else {
+    ncnPanel.style.display = 'none';
   }
 
   const lowStock = data.low_stock_categories || [];
@@ -1390,7 +1425,19 @@ function setCustStatusFilter(status){
   document.querySelectorAll('.status-filter-btn').forEach(b=>{
     b.classList.toggle('active', b.dataset.status === status);
   });
-  filterSuggest(document.getElementById('custSearch').value || '');
+  // Clicking a status chip (Active/Paused/Cancelled/All/New/etc.) means
+  // "show me everyone in that status" -- not "filter whatever I was
+  // already looking at." It used to leave the search box's text in place,
+  // so if she'd just looked someone up, the chip list stayed filtered down
+  // to that one name and her open profile below stayed showing -- looking
+  // like clicking the chip did nothing until she manually cleared the
+  // search box herself first. Clearing both the search box and the open
+  // profile here means every status chip always shows that status's full
+  // list immediately, with no manual clearing needed.
+  document.getElementById('custSearch').value = '';
+  const profileArea = document.getElementById('profileArea');
+  if(profileArea) profileArea.innerHTML = '';
+  filterSuggest('');
 }
 // Called from the "New Customers" home stat card -- it used to just open the
 // general Customers tab (showPage('customers')), which shows the full Active
@@ -1403,18 +1450,27 @@ function showNewCustomersOnly(){
   document.getElementById('custSearch').value = '';
   setCustStatusFilter('New');
 }
+// Same idea, for the "New — next month's box" home stat card.
+function showNewCustomersNextMonthOnly(){
+  showPage('customers');
+  document.getElementById('custSearch').value = '';
+  setCustStatusFilter('NewNextMonth');
+}
 async function filterSuggest(val){
   const row = document.getElementById('suggestRow');
   const all = await ensureAllCustomers();
   // "Active" means not explicitly Paused or Cancelled (older records with a
   // blank/other status still show up as active, same as
-  // recommend_v5.is_customer_due does). "New" is its own thing -- not a
-  // status at all, just "is she in the exact set the New Customers stat
-  // on Home just counted" (subscribed this calendar month).
+  // recommend_v5.is_customer_due does). "New" and "NewNextMonth" aren't
+  // statuses at all -- they're "is she in the exact set the matching New
+  // Customers home stat just counted" (see /dashboard/home_stats'
+  // 19th-of-the-month cutoff rule for which bucket she lands in).
   const byStatus = custStatusFilter === 'All'
     ? all
     : custStatusFilter === 'New'
     ? all.filter(c => newCustomersThisMonth.some(n => n.id === c.id))
+    : custStatusFilter === 'NewNextMonth'
+    ? all.filter(c => newCustomersNextMonth.some(n => n.id === c.id))
     : all.filter(c=>{
         const s = String(c.status||'').trim().toLowerCase();
         if(custStatusFilter === 'Cancelled') return s === 'cancelled';
@@ -1429,14 +1485,20 @@ async function filterSuggest(val){
   // are. A running number on each chip, plus a plain count line above the
   // whole list, means she never has to count anything herself again.
   const countNoun = custStatusFilter === 'New'
-    ? (n => `new customer${n===1?'':'s'} this month`)
+    ? (n => `new customer${n===1?'':'s'} due in this month's box`)
+    : custStatusFilter === 'NewNextMonth'
+    ? (n => `new customer${n===1?'':'s'} queued for next month's box`)
     : (n => `${custStatusFilter === 'All' ? '' : custStatusFilter.toLowerCase()+' '}customer${n===1?'':'s'}`);
   document.getElementById('suggestCount').textContent = val
     ? `${matches.length} of ${byStatus.length} ${countNoun(byStatus.length)} match "${val}"`
     : `${byStatus.length} ${countNoun(byStatus.length)}`;
 
+  const noneLabel = custStatusFilter === 'All' ? '' :
+    custStatusFilter === 'New' ? 'new (this month’s box) ' :
+    custStatusFilter === 'NewNextMonth' ? 'new (next month’s box) ' :
+    custStatusFilter.toLowerCase()+' ';
   row.innerHTML = matches.map((n,i)=>`<span class="suggest-chip" onclick="goSearch('${n.replace(/'/g,"\\'")}')"><span class="suggest-chip-num">${i+1}.</span> ${n}</span>`).join('')
-    || `<span class="suggest-chip" style="opacity:.5">no ${custStatusFilter==='All'?'':custStatusFilter.toLowerCase()+' '}customer found${val?' with that name':''}</span>`;
+    || `<span class="suggest-chip" style="opacity:.5">no ${noneLabel}customer found${val?' with that name':''}</span>`;
 }
 
 function labelize(k){

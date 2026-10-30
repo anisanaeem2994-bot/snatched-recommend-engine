@@ -2755,6 +2755,36 @@ def dashboard_backup_status():
 LOW_STOCK_THRESHOLD = 3  # a category with this many or fewer total units left,
                           # across every product in it, is flagged "critically low"
 
+# Iqra's own cutoff, not a technical one: a signup on or before the 19th of
+# a month still has enough lead time to be boxed up and shipped THAT
+# month's cycle. From the 20th onwards there isn't, so she's treated as
+# "new" for next month's box instead. This is what separates the two "new
+# customer" buckets on the Home page below, and it recalculates off
+# today's real date every time -- nothing here is hardcoded to one month,
+# so it keeps working correctly every month without any manual updating.
+NEW_CUSTOMER_CUTOFF_DAY = 19
+
+def _first_box_month(subscribed_since):
+    """Given a customer's subscribed_since date ('YYYY-MM-DD'), returns the
+    'YYYY-MM' of the box cycle she's first due to appear in, per Iqra's
+    19th-of-the-month cutoff rule above. Returns None if the date is
+    missing or unparseable (never crashes the whole stats call over one
+    bad/blank date)."""
+    s = str(subscribed_since or '').strip()
+    if len(s) < 10:
+        return None
+    try:
+        year, month, day = int(s[0:4]), int(s[5:7]), int(s[8:10])
+    except ValueError:
+        return None
+    if day <= NEW_CUSTOMER_CUTOFF_DAY:
+        return f'{year:04d}-{month:02d}'
+    # Rolls to next month -- and to next January if she signed up in
+    # December after the cutoff.
+    if month == 12:
+        return f'{year + 1:04d}-01'
+    return f'{year:04d}-{month + 1:02d}'
+
 @app.route('/dashboard/home_stats', methods=['GET'])
 @dashboard_login_required
 def dashboard_home_stats():
@@ -2804,20 +2834,36 @@ def dashboard_home_stats():
             key=lambda x: x['total_stock']
         )
 
-        # New customers THIS real calendar month (not whichever month is
-        # loaded in the generate-month picker) -- so this surfaces the
-        # moment Iqra logs in, the same way she'd want to know about a
-        # fresh WhatsApp signup regardless of what month she's working on.
+        # New customers, split by which box cycle they're actually due in
+        # (see _first_box_month/NEW_CUSTOMER_CUTOFF_DAY above) -- not just
+        # "signed up this real calendar month" like before. Two buckets:
+        #   - new_customers: due in the CURRENT real month's box. This
+        #     includes anyone who signed up this month on/before the 19th,
+        #     AND anyone who signed up last month on/after the 20th and
+        #     got rolled forward into this month.
+        #   - new_customers_next_month: already signed up, but too late
+        #     (20th or later) for this month's box -- she's queued for
+        #     next month's cycle instead. Pure math off today's date, so
+        #     both buckets stay correct every month with no manual update.
         # Matched on subscribed_since, every status included (even one
         # who already cancelled again fast is still worth her seeing).
-        this_month = _datetime.now().strftime('%Y-%m')
+        _now = _datetime.now()
+        this_month = _now.strftime('%Y-%m')
+        next_month = (f'{_now.year + 1:04d}-01' if _now.month == 12
+                       else f'{_now.year:04d}-{_now.month + 1:02d}')
+
+        def _new_customer_entry(c):
+            return {'id': c['id'], 'name': c['name'], 'subscribed_since': c.get('subscribed_since'),
+                     'status': c.get('status')}
+
         new_customers = sorted(
-            [
-                {'id': c['id'], 'name': c['name'], 'subscribed_since': c.get('subscribed_since'),
-                 'status': c.get('status')}
-                for c in customers.values()
-                if str(c.get('subscribed_since') or '').startswith(this_month)
-            ],
+            [_new_customer_entry(c) for c in customers.values()
+             if _first_box_month(c.get('subscribed_since')) == this_month],
+            key=lambda c: c['subscribed_since'] or ''
+        )
+        new_customers_next_month = sorted(
+            [_new_customer_entry(c) for c in customers.values()
+             if _first_box_month(c.get('subscribed_since')) == next_month],
             key=lambda c: c['subscribed_since'] or ''
         )
 
@@ -2836,7 +2882,8 @@ def dashboard_home_stats():
 
         return jsonify({
             'birthdays': birthdays, 'low_stock_categories': low_stock, 'low_stock_threshold': LOW_STOCK_THRESHOLD,
-            'new_customers': new_customers, 'pending_review': pending_review,
+            'new_customers': new_customers, 'new_customers_next_month': new_customers_next_month,
+            'pending_review': pending_review,
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
