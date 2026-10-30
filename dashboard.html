@@ -1437,6 +1437,11 @@ function setCustStatusFilter(status){
   document.getElementById('custSearch').value = '';
   const profileArea = document.getElementById('profileArea');
   if(profileArea) profileArea.innerHTML = '';
+  // Also invalidates any /customer_lookup fetch still in flight for this
+  // target (see profileRenderGen in renderProfileInto above) -- otherwise
+  // a slow lookup that was already underway when she clicked this chip
+  // would land a moment later and silently put the profile right back.
+  profileRenderGen['profileArea'] = (profileRenderGen['profileArea'] || 0) + 1;
   filterSuggest('');
 }
 // Called from the "New Customers" home stat card -- it used to just open the
@@ -1686,16 +1691,30 @@ async function createNewCustomer(){
   }catch(e){ alert('Could not create customer: ' + e.message); }
 }
 
+// Bumped once per renderProfileInto call (per targetId), and also whenever
+// something else clears that target (see setCustStatusFilter's clearing of
+// 'profileArea'). A slow /customer_lookup response checks this before it
+// ever writes to the DOM -- if something newer has since claimed this
+// target (a different name searched, or the view cleared out from under
+// it), the stale response is dropped instead of silently overwriting
+// whatever's shown now. Without this, clicking a status filter chip right
+// after a profile was still loading could clear the profile area only for
+// the in-flight lookup to land a moment later and put it right back.
+let profileRenderGen = {};
+
 async function renderProfileInto(targetId, name){
+  const myGen = (profileRenderGen[targetId] = (profileRenderGen[targetId] || 0) + 1);
   const area = document.getElementById(targetId);
   area.innerHTML = `<div class="empty-note">Loading…</div>`;
   let data;
   try{
     data = await api('/customer_lookup?name=' + encodeURIComponent(name));
   }catch(e){
+    if(profileRenderGen[targetId] !== myGen) return;  // superseded while loading
     area.innerHTML = `<div class="empty-note">Couldn't load her profile: ${e.message}. <a href="#" onclick="renderProfileInto('${targetId}','${name.replace(/'/g,"\\'")}');return false;">Try again</a></div>`;
     return;
   }
+  if(profileRenderGen[targetId] !== myGen) return;  // superseded while loading
   if(!data || data.error){
     area.innerHTML = `<div class="empty-note">${(data && data.error) || 'No customer found named "'+name+'".'}</div>`;
     return;
