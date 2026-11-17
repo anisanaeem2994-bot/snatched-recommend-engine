@@ -4025,13 +4025,18 @@ def dashboard_month_customers_download():
         for cell in ws[1]:
             cell.font = openpyxl.styles.Font(bold=True)
         for e in entries:
-            products_text = '\n'.join(p for p in e['products'] if p)
+            # Comma-separated on one line, not one-product-per-line with
+            # wrap_text -- wrapped multi-line cells looked broken in Canva
+            # (it doesn't grow the row height to match, so line 2+ bleeds
+            # into the row below instead of wrapping inside its own cell).
+            # A single line is plain text that displays correctly no matter
+            # how a given app handles row height, and is just as easy to
+            # copy-paste into a pamphlet.
+            products_text = ', '.join(p for p in e['products'] if p)
             ws.append([e['customer_name'], e.get('box_type') or '', products_text])
         ws.column_dimensions['A'].width = 28
         ws.column_dimensions['B'].width = 16
-        ws.column_dimensions['C'].width = 60
-        for row in ws.iter_rows(min_row=2):
-            row[2].alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
+        ws.column_dimensions['C'].width = 90
 
         buf = io.BytesIO()
         out_wb.save(buf)
