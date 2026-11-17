@@ -352,7 +352,9 @@
           <option value="">Loading months…</option>
         </select>
         <button class="btn btn-swap" onclick="viewPastMonth()">View</button>
+        <button class="btn btn-outline" onclick="downloadMonthSpreadsheet(document.getElementById('pastMonthSelect').value, 'pastMonthDownloadStatus')" title="A small spreadsheet — just customer name and products, no technical sheets. Opens anywhere, including Canva.">⬇ Download spreadsheet</button>
       </div>
+      <div id="pastMonthDownloadStatus" style="font-size:12px;color:var(--muted);margin:4px 0 0;"></div>
       <div id="pastMonthResult" style="margin-top:10px;"></div>
       <div id="pamphletArea" style="display:none;margin-top:10px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
@@ -411,7 +413,9 @@
       <div class="row-line" style="gap:8px;flex-wrap:wrap;">
         <button class="btn btn-outline" onclick="loadApprovedPamphlet()">🔄 Load / refresh list</button>
         <button class="btn-edit-toggle" id="approvedPamphletCopyBtn" onclick="copyApprovedPamphletText()" style="display:none;">📋 Copy to clipboard</button>
+        <button class="btn btn-outline" onclick="downloadMonthSpreadsheet(currentMonth, 'approvedPamphletDownloadStatus')" title="A small spreadsheet — just customer name and products, no technical sheets. Opens anywhere, including Canva.">⬇ Download spreadsheet</button>
       </div>
+      <div id="approvedPamphletDownloadStatus" style="font-size:12px;color:var(--muted);margin:4px 0 0;"></div>
       <div id="approvedPamphletCount" style="font-size:12px;color:var(--muted);margin:8px 0 0;"></div>
       <textarea id="approvedPamphletTextArea" readonly rows="12" style="display:none;width:100%;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:12.5px;font-family:monospace;white-space:pre-wrap;" onclick="this.select()"></textarea>
     </div>
@@ -1213,6 +1217,49 @@ async function downloadWorkbook(){
   }finally{
     btn.disabled = false;
     btn.textContent = origLabel;
+  }
+}
+
+// Small, plain spreadsheet for ONE month -- just customer name, box type,
+// and the products she got. Built because the full 9-sheet master workbook
+// was too big for Iqra's usual way of opening a download (Canva's sheet
+// importer caps at 1,000 rows / 26,000 cells, which the full workbook blows
+// past); a single month's approved list is normally a few dozen rows, so it
+// opens anywhere. statusElId is whichever status line is next to the button
+// that was clicked (the panel on the review page, or Past months).
+async function downloadMonthSpreadsheet(month, statusElId){
+  const statusEl = document.getElementById(statusElId);
+  if(!month){
+    if(statusEl) statusEl.textContent = 'Pick a month first.';
+    return;
+  }
+  if(statusEl) statusEl.textContent = 'Getting the file ready…';
+  try{
+    const resp = await fetch('/dashboard/month_customers_download?month=' + encodeURIComponent(month), { credentials: 'same-origin' });
+    if(!resp.ok){
+      let msg = `Server returned an error (${resp.status}).`;
+      try{ const j = await resp.json(); if(j && j.error) msg = j.error; }catch(e){}
+      if(statusEl) statusEl.textContent = '❌ Could not download: ' + msg;
+      return;
+    }
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="?([^"]+)"?/);
+    const filename = match ? match[1] : `approved_${month}.xlsx`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    if(statusEl){
+      statusEl.textContent = '✔ Downloaded — open it in Excel, Numbers, or Google Sheets (not Canva — its sheet importer is too limited for a real spreadsheet).';
+      setTimeout(() => { if(statusEl.textContent.startsWith('✔')) statusEl.textContent = ''; }, 9000);
+    }
+  }catch(e){
+    if(statusEl) statusEl.textContent = '❌ Could not reach the server (' + e.message + '). Try again in a moment.';
   }
 }
 

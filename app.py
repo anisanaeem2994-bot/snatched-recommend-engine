@@ -28,6 +28,7 @@ Endpoints:
 from flask import Flask, request, jsonify, session, redirect, url_for
 import os
 import re
+import io
 import json
 import tempfile
 import importlib
@@ -37,6 +38,7 @@ import requests
 import base64 as base64_lib
 import threading
 import time
+import openpyxl
 
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 GITHUB_REPO = 'anisanaeem2994-bot/snatched-recommend-engine'
@@ -3918,15 +3920,12 @@ def dashboard_download_workbook():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/dashboard/approved_report', methods=['GET'])
-@dashboard_login_required
-def dashboard_approved_report():
-    """Builds the 'everything approved this month' list Iqra actually
-    wants for making pamphlets -- one entry per customer with exactly the
-    products confirmed going in her box, clean enough to copy straight
-    into a flyer. The full backup spreadsheet download is a technical,
-    9-sheet file meant for safekeeping, not for this -- this is a
-    purpose-built, plain list instead.
+def _build_approved_entries(target_month):
+    """Shared data-gathering for 'everything approved this month' --
+    one entry per customer with exactly the products confirmed going in
+    her box. Used by both the in-page pamphlet-text endpoint and the
+    small downloadable-spreadsheet endpoint below, so the two never
+    drift out of sync with each other.
 
     Combines two sources so it's accurate at any point in the month,
     before or after committing:
@@ -3941,53 +3940,107 @@ def dashboard_approved_report():
         yet.
     A customer who's only partially approved doesn't appear at all --
     this is for products that are DEFINITELY going out, not a draft."""
+    wb = recommend_v5.wb
+    entries = {}  # customer_name -> {customer_id, box_type, products}
+
+    ws_boxes = wb['boxes']
+    box_status = {}
+    for row in ws_boxes.iter_rows(min_row=2, values_only=True):
+        if not row or not row[0]:
+            continue
+        box_id = row[0]
+        status = row[4] if len(row) > 4 else None
+        box_status[box_id] = status
+
+    ws_items = wb['box_items']
+    for row in ws_items.iter_rows(min_row=2, values_only=True):
+        if not row or not row[0]:
+            continue
+        padded = (list(row) + [None] * 7)[:7]
+        _item_id, cust_name, cust_id, month, box_type, box_id, product = padded
+        if month != target_month or not cust_name:
+            continue
+        if str(box_status.get(box_id, '')).strip().lower() == 'cancelled':
+            continue
+        e = entries.setdefault(cust_name, {'customer_id': cust_id, 'box_type': box_type, 'products': []})
+        if product:
+            e['products'].append(product)
+
+    ws_board = _get_dash_sheet(create=False)
+    for b in _parse_dash_sheet(ws_board):
+        if b.get('month') != target_month or b['customer_name'] in entries:
+            continue
+        if not b['items'] or any(i['status'] != 'Approved' for i in b['items']):
+            continue
+        entries[b['customer_name']] = {
+            'customer_id': b['customer_id'], 'box_type': b['box_type'],
+            'products': [i['name'] for i in b['items'] if i['name']],
+        }
+
+    return sorted(
+        [{'customer_name': name, **data} for name, data in entries.items()],
+        key=lambda e: e['customer_name'].lower()
+    )
+
+@app.route('/dashboard/approved_report', methods=['GET'])
+@dashboard_login_required
+def dashboard_approved_report():
+    """JSON version of the 'everything approved this month' list, for the
+    in-page pamphlet-text panel. The full backup spreadsheet download is a
+    technical, 9-sheet file meant for safekeeping, not for this -- this is
+    a purpose-built, plain list instead. See _build_approved_entries()."""
     target_month = request.args.get('month')
     if not target_month:
         return jsonify({'error': 'month is required (YYYY-MM).'}), 400
     try:
         _reload_if_needed()
-        wb = recommend_v5.wb
-        entries = {}  # customer_name -> {customer_id, box_type, products}
-
-        ws_boxes = wb['boxes']
-        box_status = {}
-        for row in ws_boxes.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            box_id = row[0]
-            status = row[4] if len(row) > 4 else None
-            box_status[box_id] = status
-
-        ws_items = wb['box_items']
-        for row in ws_items.iter_rows(min_row=2, values_only=True):
-            if not row or not row[0]:
-                continue
-            padded = (list(row) + [None] * 7)[:7]
-            _item_id, cust_name, cust_id, month, box_type, box_id, product = padded
-            if month != target_month or not cust_name:
-                continue
-            if str(box_status.get(box_id, '')).strip().lower() == 'cancelled':
-                continue
-            e = entries.setdefault(cust_name, {'customer_id': cust_id, 'box_type': box_type, 'products': []})
-            if product:
-                e['products'].append(product)
-
-        ws_board = _get_dash_sheet(create=False)
-        for b in _parse_dash_sheet(ws_board):
-            if b.get('month') != target_month or b['customer_name'] in entries:
-                continue
-            if not b['items'] or any(i['status'] != 'Approved' for i in b['items']):
-                continue
-            entries[b['customer_name']] = {
-                'customer_id': b['customer_id'], 'box_type': b['box_type'],
-                'products': [i['name'] for i in b['items'] if i['name']],
-            }
-
-        result = sorted(
-            [{'customer_name': name, **data} for name, data in entries.items()],
-            key=lambda e: e['customer_name'].lower()
-        )
+        result = _build_approved_entries(target_month)
         return jsonify({'month': target_month, 'customers': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/dashboard/month_customers_download', methods=['GET'])
+@dashboard_login_required
+def dashboard_month_customers_download():
+    """A small, plain .xlsx for one month -- just customer name, box
+    type, and the products she got -- instead of the full 9-sheet master
+    workbook. Built specifically because the full workbook was too big
+    for Iqra's usual way of opening a downloaded spreadsheet (Canva's own
+    sheet importer caps out at 1,000 rows / 26,000 cells, which the full
+    workbook blows past easily); this file has one row per customer and
+    typically well under a hundred rows, so it opens anywhere -- Canva
+    included. Same underlying data as /dashboard/approved_report, just as
+    a real downloadable file instead of in-page text."""
+    target_month = request.args.get('month')
+    if not target_month:
+        return jsonify({'error': 'month is required (YYYY-MM).'}), 400
+    try:
+        _reload_if_needed()
+        entries = _build_approved_entries(target_month)
+
+        out_wb = openpyxl.Workbook()
+        ws = out_wb.active
+        ws.title = 'Approved boxes'
+        ws.append(['Customer name', 'Box type', 'Products'])
+        for cell in ws[1]:
+            cell.font = openpyxl.styles.Font(bold=True)
+        for e in entries:
+            products_text = '\n'.join(p for p in e['products'] if p)
+            ws.append([e['customer_name'], e.get('box_type') or '', products_text])
+        ws.column_dimensions['A'].width = 28
+        ws.column_dimensions['B'].width = 16
+        ws.column_dimensions['C'].width = 60
+        for row in ws.iter_rows(min_row=2):
+            row[2].alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
+
+        buf = io.BytesIO()
+        out_wb.save(buf)
+        buf.seek(0)
+        from flask import send_file
+        return send_file(
+            buf, as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            download_name=f'approved_{target_month}.xlsx'
+        )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
