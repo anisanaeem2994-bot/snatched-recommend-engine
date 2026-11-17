@@ -3918,6 +3918,79 @@ def dashboard_download_workbook():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/dashboard/approved_report', methods=['GET'])
+@dashboard_login_required
+def dashboard_approved_report():
+    """Builds the 'everything approved this month' list Iqra actually
+    wants for making pamphlets -- one entry per customer with exactly the
+    products confirmed going in her box, clean enough to copy straight
+    into a flyer. The full backup spreadsheet download is a technical,
+    9-sheet file meant for safekeeping, not for this -- this is a
+    purpose-built, plain list instead.
+
+    Combines two sources so it's accurate at any point in the month,
+    before or after committing:
+      - Customers already committed for this month (their items live
+        permanently in box_items once /dashboard/commit_month runs and
+        pulls them off the working board) -- excluding any box that was
+        since cancelled via /dashboard/cancel_box (still on record, but
+        not actually going out).
+      - Customers still sitting on the open working board who already
+        have every single item Approved (same "ready to commit" bar
+        /dashboard/commit_month itself uses) but haven't been committed
+        yet.
+    A customer who's only partially approved doesn't appear at all --
+    this is for products that are DEFINITELY going out, not a draft."""
+    target_month = request.args.get('month')
+    if not target_month:
+        return jsonify({'error': 'month is required (YYYY-MM).'}), 400
+    try:
+        _reload_if_needed()
+        wb = recommend_v5.wb
+        entries = {}  # customer_name -> {customer_id, box_type, products}
+
+        ws_boxes = wb['boxes']
+        box_status = {}
+        for row in ws_boxes.iter_rows(min_row=2, values_only=True):
+            if not row or not row[0]:
+                continue
+            box_id = row[0]
+            status = row[4] if len(row) > 4 else None
+            box_status[box_id] = status
+
+        ws_items = wb['box_items']
+        for row in ws_items.iter_rows(min_row=2, values_only=True):
+            if not row or not row[0]:
+                continue
+            padded = (list(row) + [None] * 7)[:7]
+            _item_id, cust_name, cust_id, month, box_type, box_id, product = padded
+            if month != target_month or not cust_name:
+                continue
+            if str(box_status.get(box_id, '')).strip().lower() == 'cancelled':
+                continue
+            e = entries.setdefault(cust_name, {'customer_id': cust_id, 'box_type': box_type, 'products': []})
+            if product:
+                e['products'].append(product)
+
+        ws_board = _get_dash_sheet(create=False)
+        for b in _parse_dash_sheet(ws_board):
+            if b.get('month') != target_month or b['customer_name'] in entries:
+                continue
+            if not b['items'] or any(i['status'] != 'Approved' for i in b['items']):
+                continue
+            entries[b['customer_name']] = {
+                'customer_id': b['customer_id'], 'box_type': b['box_type'],
+                'products': [i['name'] for i in b['items'] if i['name']],
+            }
+
+        result = sorted(
+            [{'customer_name': name, **data} for name, data in entries.items()],
+            key=lambda e: e['customer_name'].lower()
+        )
+        return jsonify({'month': target_month, 'customers': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/dashboard/commit_month', methods=['POST'])
 @dashboard_login_required
 def dashboard_commit_month():

@@ -243,6 +243,7 @@
     <button class="tab-btn active" data-page="home">Home</button>
     <button class="tab-btn" data-page="review">This Month</button>
     <button class="tab-btn" data-page="customers">Customers</button>
+    <button class="tab-btn" data-page="inventory">Inventory</button>
   </nav>
   <div class="search-wrap">
     <span class="icon">🔍</span>
@@ -283,7 +284,7 @@
         <div class="stat-label">boxes to review this month</div>
         <div class="stat-sublabel" style="font-size:10.5px;color:var(--muted);margin-top:2px;">everyone currently on the board — may include some of the "new" customers below too</div>
       </div>
-      <div class="stat-card purple" onclick="showPage('review')">
+      <div class="stat-card purple" onclick="showApprovedBoxesOnly()">
         <div class="stat-num" id="homeApprovedCount">—</div>
         <div class="stat-label">approved so far</div>
       </div>
@@ -344,6 +345,84 @@
     </div>
 
     <div class="panel">
+      <h3>📅 Past months</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Look back at any month that's already gone out — who got a box, and exactly what was in it.</div>
+      <div class="row-line" style="gap:8px;flex-wrap:wrap;">
+        <select id="pastMonthSelect" style="flex:1;min-width:160px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+          <option value="">Loading months…</option>
+        </select>
+        <button class="btn btn-swap" onclick="viewPastMonth()">View</button>
+      </div>
+      <div id="pastMonthResult" style="margin-top:10px;"></div>
+      <div id="pamphletArea" style="display:none;margin-top:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
+          <span style="font-size:11.5px;color:var(--muted);">Personalized pamphlet text for this month — one block per customer, cancelled boxes left out. Select all and copy, or use the button.</span>
+          <button class="btn-edit-toggle" id="pamphletCopyBtn" onclick="copyPamphletText()">📋 Copy to clipboard</button>
+        </div>
+        <textarea id="pamphletTextArea" readonly rows="12" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:12.5px;font-family:monospace;white-space:pre-wrap;" onclick="this.select()"></textarea>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>✅ Quick actions</h3>
+      <div class="row-line"><span>Review & approve this month's boxes</span><button class="btn btn-approve" onclick="showPage('review')">Go to review →</button></div>
+      <div class="row-line"><span>Check a customer's history before deciding a swap</span><button class="btn btn-swap" onclick="showPage('customers')">Search a customer →</button></div>
+      <div class="row-line"><span>See everything at once — every customer, every box, full inventory</span><button class="btn btn-undo" id="downloadWorkbookBtn" onclick="downloadWorkbook()">Download full spreadsheet ↓</button></div>
+      <div id="downloadWorkbookStatus" style="font-size:12px;color:var(--muted);margin-top:6px;"></div>
+    </div>
+  </div>
+
+  <!-- ============ REVIEW ============ -->
+  <div class="page" id="page-review">
+    <h1 class="page-title">This month's boxes</h1>
+    <p class="page-sub">Swap what doesn't fit, approve what does. Everything updates instantly — no typing into cells.</p>
+
+    <div class="month-controls">
+      <div>
+        <div style="font-size:13px;font-weight:700;margin-bottom:6px;" id="progressLabel">0 of 0 approved</div>
+        <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+      </div>
+      <button class="commit-btn" id="commitBtn" onclick="tryCommit()">Commit Month →</button>
+    </div>
+    <div class="row-line" style="margin:-4px 0 10px;justify-content:flex-end;">
+      <button class="btn btn-undo" onclick="resyncBoard()" title="Re-checks everyone on this board against their current status and removes anyone paused/cancelled since it was generated">🔄 Resync board (recheck who's still active)</button>
+    </div>
+
+    <div class="row-line" style="gap:8px;flex-wrap:wrap;margin:0 0 6px;">
+      <input id="reviewSearch" placeholder="Find a customer on this board…" oninput="setReviewNameFilter(this.value)" style="flex:1;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+      <select id="reviewStatusFilter" onchange="setReviewStatusFilter(this.value)" style="padding:8px 10px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <option value="All">All statuses</option>
+        <option value="Approved">Fully approved</option>
+        <option value="Pending">Still pending</option>
+      </select>
+      <select id="reviewTierFilter" onchange="setReviewTierFilter(this.value)" style="padding:8px 10px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
+        <option value="All">All tiers</option>
+      </select>
+    </div>
+    <div id="reviewFilterCount" style="font-size:12px;color:var(--muted);margin:0 0 10px;"></div>
+
+    <div id="custList"></div>
+    <div class="empty-note" id="reviewNoMatchNote" style="display:none;">No one on this board matches that filter.</div>
+    <div class="empty-note" id="reviewEmptyNote" style="display:none;">Nothing on the board yet — generate this month's boxes from the Home tab first.</div>
+
+    <div class="panel" style="margin-top:18px;">
+      <h3>📋 Approved this month — ready for pamphlets</h3>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Every customer with a fully-approved box this month — committed already or still sitting on the board above, as long as every item is Approved. Product list below, ready to copy straight into a pamphlet. Partially-approved customers won't show up here yet.</div>
+      <div class="row-line" style="gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-outline" onclick="loadApprovedPamphlet()">🔄 Load / refresh list</button>
+        <button class="btn-edit-toggle" id="approvedPamphletCopyBtn" onclick="copyApprovedPamphletText()" style="display:none;">📋 Copy to clipboard</button>
+      </div>
+      <div id="approvedPamphletCount" style="font-size:12px;color:var(--muted);margin:8px 0 0;"></div>
+      <textarea id="approvedPamphletTextArea" readonly rows="12" style="display:none;width:100%;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:12.5px;font-family:monospace;white-space:pre-wrap;" onclick="this.select()"></textarea>
+    </div>
+  </div>
+
+  <!-- ============ INVENTORY ============ -->
+  <div class="page" id="page-inventory">
+    <h1 class="page-title">Inventory</h1>
+    <p class="page-sub">Add stock, paste a whole restock list, or check exactly what's on hand right now.</p>
+
+    <div class="panel">
       <h3>📦 Add inventory</h3>
       <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Type a product name. If it already exists, this <b>restocks it</b> — adds to whatever count it already has. If it's brand new, it creates the product for you. No spreadsheet needed.</div>
       <div class="row-line" style="gap:8px;flex-wrap:wrap;align-items:flex-start;">
@@ -399,52 +478,6 @@
       <div id="invViewEditArea"></div>
       <div id="invViewTable" style="max-height:340px;overflow-y:auto;"></div>
     </div>
-
-    <div class="panel">
-      <h3>📅 Past months</h3>
-      <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Look back at any month that's already gone out — who got a box, and exactly what was in it.</div>
-      <div class="row-line" style="gap:8px;flex-wrap:wrap;">
-        <select id="pastMonthSelect" style="flex:1;min-width:160px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-size:13px;">
-          <option value="">Loading months…</option>
-        </select>
-        <button class="btn btn-swap" onclick="viewPastMonth()">View</button>
-      </div>
-      <div id="pastMonthResult" style="margin-top:10px;"></div>
-      <div id="pamphletArea" style="display:none;margin-top:10px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
-          <span style="font-size:11.5px;color:var(--muted);">Personalized pamphlet text for this month — one block per customer, cancelled boxes left out. Select all and copy, or use the button.</span>
-          <button class="btn-edit-toggle" id="pamphletCopyBtn" onclick="copyPamphletText()">📋 Copy to clipboard</button>
-        </div>
-        <textarea id="pamphletTextArea" readonly rows="12" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:12.5px;font-family:monospace;white-space:pre-wrap;" onclick="this.select()"></textarea>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h3>✅ Quick actions</h3>
-      <div class="row-line"><span>Review & approve this month's boxes</span><button class="btn btn-approve" onclick="showPage('review')">Go to review →</button></div>
-      <div class="row-line"><span>Check a customer's history before deciding a swap</span><button class="btn btn-swap" onclick="showPage('customers')">Search a customer →</button></div>
-      <div class="row-line"><span>See everything at once — every customer, every box, full inventory</span><a class="btn btn-undo" href="/dashboard/download_workbook" style="text-decoration:none;">Download full spreadsheet ↓</a></div>
-    </div>
-  </div>
-
-  <!-- ============ REVIEW ============ -->
-  <div class="page" id="page-review">
-    <h1 class="page-title">This month's boxes</h1>
-    <p class="page-sub">Swap what doesn't fit, approve what does. Everything updates instantly — no typing into cells.</p>
-
-    <div class="month-controls">
-      <div>
-        <div style="font-size:13px;font-weight:700;margin-bottom:6px;" id="progressLabel">0 of 0 approved</div>
-        <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
-      </div>
-      <button class="commit-btn" id="commitBtn" onclick="tryCommit()">Commit Month →</button>
-    </div>
-    <div class="row-line" style="margin:-4px 0 10px;justify-content:flex-end;">
-      <button class="btn btn-undo" onclick="resyncBoard()" title="Re-checks everyone on this board against their current status and removes anyone paused/cancelled since it was generated">🔄 Resync board (recheck who's still active)</button>
-    </div>
-
-    <div id="custList"></div>
-    <div class="empty-note" id="reviewEmptyNote" style="display:none;">Nothing on the board yet — generate this month's boxes from the Home tab first.</div>
   </div>
 
   <!-- ============ CUSTOMERS ============ -->
@@ -477,6 +510,8 @@
 
 </main>
 
+<button id="backToTopBtn" title="Back to top" onclick="window.scrollTo({top:0,behavior:'smooth'})" style="display:none;align-items:center;justify-content:center;position:fixed;right:22px;bottom:22px;width:46px;height:46px;border-radius:50%;border:none;background:var(--pink-dark,#C27BA0);color:#fff;font-size:20px;line-height:1;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,0.25);z-index:999;">↑</button>
+
 <script>
 /* ================= real data layer — everything below calls the live
    Flask endpoints. No static/sample data anywhere in this file. ================= */
@@ -489,6 +524,16 @@ let currentMonth = null;
 let custStatusFilter = 'Active';  // which customers the search/suggest list shows: Active (default), Paused, Cancelled, All, or New
 let newCustomersThisMonth = [];  // from /dashboard/home_stats's new_customers -- the exact set the "New Customers" home stat counts, kept here so clicking it can filter down to just these instead of showing every active customer
 let newCustomersNextMonth = []; // from /dashboard/home_stats's new_customers_next_month -- same idea, for the "queued for next month's box" bucket
+
+// "This Month's Boxes" board filters -- purely client-side over the
+// already-loaded boardCustomers, so switching filters is instant with no
+// extra server round trip. Status/tier persist across re-renders (every
+// approve/swap/pick calls loadBoard() -> renderReview() again), so a
+// filter she picked stays applied through normal use instead of resetting
+// itself on every action.
+let reviewFilterName = '';
+let reviewFilterStatus = 'All';  // 'All' | 'Approved' (fully approved) | 'Pending' (not fully approved yet)
+let reviewFilterTier = 'All';    // 'All' or an exact box_type tier string seen on this board
 
 async function ensureAllCustomers(){
   if(allCustomersList) return allCustomersList;
@@ -731,11 +776,52 @@ function renderReview(){
   wrap.innerHTML = '';
   emptyNote.style.display = boardCustomers.length ? 'none' : 'block';
 
+  // Tier dropdown options are built from whatever's actually on this
+  // month's board, not a hardcoded list -- so it never goes stale if a
+  // new tier name shows up. Keeps her current selection if it's still a
+  // valid choice after the rebuild.
+  const tierSelect = document.getElementById('reviewTierFilter');
+  const tiers = [...new Set(boardCustomers.map(c => (c.box_type||'').split('(')[0].trim()).filter(Boolean))].sort();
+  const prevTierChoice = tierSelect.value;
+  tierSelect.innerHTML = '<option value="All">All tiers</option>' +
+    tiers.map(t => `<option value="${t}">${t}</option>`).join('');
+  if(tiers.includes(reviewFilterTier) || reviewFilterTier === 'All'){
+    tierSelect.value = reviewFilterTier;
+  } else {
+    reviewFilterTier = 'All';
+    tierSelect.value = 'All';
+  }
+
+  // Stats (progress bar, Commit button) always reflect the WHOLE board --
+  // filtering below only changes which cards are shown, never what counts
+  // as approved/ready to commit.
   let approvedTotal = 0;
-  boardCustomers.forEach((cust, custIdx)=>{
+  boardCustomers.forEach(cust=>{
     const approvedHere = cust.items.filter(i=>i.status==='Approved').length;
     if(approvedHere === cust.items.length && cust.items.length) approvedTotal += 1;
+  });
 
+  const nameNeedle = reviewFilterName.trim().toLowerCase();
+  const visible = boardCustomers
+    .map((cust, custIdx) => ({cust, custIdx}))
+    .filter(({cust}) => {
+      if(nameNeedle && !cust.customer_name.toLowerCase().includes(nameNeedle)) return false;
+      const approvedHere = cust.items.filter(i=>i.status==='Approved').length;
+      const fullyApproved = approvedHere === cust.items.length && cust.items.length > 0;
+      if(reviewFilterStatus === 'Approved' && !fullyApproved) return false;
+      if(reviewFilterStatus === 'Pending' && fullyApproved) return false;
+      if(reviewFilterTier !== 'All' && (cust.box_type||'').split('(')[0].trim() !== reviewFilterTier) return false;
+      return true;
+    });
+
+  const noMatchNote = document.getElementById('reviewNoMatchNote');
+  noMatchNote.style.display = (boardCustomers.length && !visible.length) ? 'block' : 'none';
+  const countEl = document.getElementById('reviewFilterCount');
+  const filtering = nameNeedle || reviewFilterStatus !== 'All' || reviewFilterTier !== 'All';
+  countEl.textContent = (boardCustomers.length && filtering) ? `Showing ${visible.length} of ${boardCustomers.length}` : '';
+
+  visible.forEach(({cust, custIdx})=>{
+    const approvedHere = cust.items.filter(i=>i.status==='Approved').length;
     const totalPrice = cust.items.reduce((s,i)=> s + (Number(i.price)||0), 0);
 
     const card = document.createElement('div');
@@ -798,6 +884,44 @@ function renderReview(){
   }
 
   renderHome();
+}
+
+// The three "This Month's Boxes" filter controls -- each just updates the
+// shared filter state and re-renders from the board data already in
+// memory (no server round trip), so switching filters is instant.
+function setReviewNameFilter(val){
+  reviewFilterName = val || '';
+  renderReview();
+}
+function setReviewStatusFilter(val){
+  reviewFilterStatus = val;
+  renderReview();
+}
+function setReviewTierFilter(val){
+  reviewFilterTier = val;
+  renderReview();
+}
+// Used by the "Approved so far" home stat (see showApprovedBoxesOnly
+// below) to land on the review page already filtered to fully-approved
+// customers, with the controls themselves reflecting that choice.
+function applyReviewFilters(status, name){
+  reviewFilterStatus = status || 'All';
+  reviewFilterName = name || '';
+  const statusEl = document.getElementById('reviewStatusFilter');
+  const nameEl = document.getElementById('reviewSearch');
+  if(statusEl) statusEl.value = reviewFilterStatus;
+  if(nameEl) nameEl.value = reviewFilterName;
+  renderReview();
+}
+// "Approved so far" home stat -- used to just dump her on the whole,
+// unfiltered board (the same "everyone" list as "boxes to review"), so
+// clicking it didn't actually show the approved ones specifically. Now it
+// opens This Month's Boxes pre-filtered to fully-approved customers, and
+// since the status dropdown is a normal control she can switch it back to
+// "All statuses" herself any time.
+function showApprovedBoxesOnly(){
+  showPage('review');
+  applyReviewFilters('Approved', '');
 }
 
 function renderItemRow(it){
@@ -973,6 +1097,122 @@ async function copyPamphletText(){
     ta.focus();
     ta.select();
     flash('Select-all ready — press Ctrl/Cmd+C');
+  }
+}
+
+// "Approved this month" pamphlet list — separate from the Past-months
+// history above on purpose. Past-months only knows about committed
+// boxes, so the CURRENT month can't show up there until Iqra commits
+// it. This pulls straight from /dashboard/approved_report, which
+// combines anyone already committed this month with anyone still on
+// the open board who's fully Approved but not committed yet, so she
+// can start copying pamphlet text any time during the month, not just
+// at the very end.
+let lastApprovedPamphletData = null;
+
+async function loadApprovedPamphlet(){
+  const countEl = document.getElementById('approvedPamphletCount');
+  const ta = document.getElementById('approvedPamphletTextArea');
+  const copyBtn = document.getElementById('approvedPamphletCopyBtn');
+  if(!currentMonth){
+    countEl.textContent = 'No month loaded yet — generate this month\'s boxes from the Home tab first.';
+    ta.style.display = 'none';
+    copyBtn.style.display = 'none';
+    return;
+  }
+  countEl.textContent = 'Loading…';
+  ta.style.display = 'none';
+  copyBtn.style.display = 'none';
+  lastApprovedPamphletData = null;
+  try{
+    const data = await api('/dashboard/approved_report?month=' + encodeURIComponent(currentMonth));
+    if(!data || data.error){
+      countEl.textContent = (data && data.error) || 'Could not load the approved list.';
+      return;
+    }
+    lastApprovedPamphletData = data;
+    const customers = data.customers || [];
+    if(!customers.length){
+      countEl.textContent = `No one is fully approved for ${currentMonth} yet.`;
+      return;
+    }
+    countEl.textContent = `${customers.length} customer${customers.length===1?'':'s'} fully approved for ${currentMonth}.`;
+    ta.value = buildApprovedPamphletText(data);
+    ta.style.display = 'block';
+    copyBtn.style.display = 'inline-block';
+  }catch(e){
+    countEl.textContent = 'Could not load the approved list: ' + e.message;
+  }
+}
+
+function buildApprovedPamphletText(data){
+  const blocks = (data.customers || []).map(c => {
+    const header = `${c.customer_name} — ${data.month}${c.box_type ? ' — ' + c.box_type : ''}`;
+    const items = (c.products && c.products.length)
+      ? c.products.map(p => `- ${p}`).join('\n')
+      : '- (no items on record)';
+    return `${header}\n${items}`;
+  });
+  return blocks.join('\n\n');
+}
+
+async function copyApprovedPamphletText(){
+  const ta = document.getElementById('approvedPamphletTextArea');
+  const btn = document.getElementById('approvedPamphletCopyBtn');
+  const text = ta.value;
+  const flash = (label) => { const orig = btn.textContent; btn.textContent = label; setTimeout(()=>{ btn.textContent = orig; }, 1800); };
+  try{
+    await navigator.clipboard.writeText(text);
+    flash('✔ Copied');
+  }catch(e){
+    ta.focus();
+    ta.select();
+    flash('Select-all ready — press Ctrl/Cmd+C');
+  }
+}
+
+// Full-workbook download, rebuilt so clicking it actually DOES something
+// visible. The old version was a plain link — if the server happens to be
+// asleep (free hosting spins it down after inactivity and can take up to
+// a minute to wake back up), clicking it looked like absolutely nothing
+// happened, which is exactly what Iqra was seeing. This fetches the file
+// instead, shows a clear "preparing" state the whole time it's waiting,
+// warns up front that a slow first load is normal, and shows a real error
+// message instead of silence if something actually does go wrong.
+async function downloadWorkbook(){
+  const btn = document.getElementById('downloadWorkbookBtn');
+  const statusEl = document.getElementById('downloadWorkbookStatus');
+  const origLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Preparing…';
+  statusEl.textContent = 'Getting the file ready — this can take up to a minute if the dashboard has been idle for a while. Please don\'t close this page.';
+  try{
+    const resp = await fetch('/dashboard/download_workbook', { credentials: 'same-origin' });
+    if(!resp.ok){
+      let msg = `Server returned an error (${resp.status}).`;
+      try{ const j = await resp.json(); if(j && j.error) msg = j.error; }catch(e){}
+      statusEl.textContent = '❌ Could not download: ' + msg + ' — try again, or let me know if this keeps happening.';
+      return;
+    }
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="?([^"]+)"?/);
+    const filename = match ? match[1] : `snatched_beauty_box_master_${new Date().toISOString().slice(0,10)}.xlsx`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    statusEl.textContent = '✔ Downloaded — check your Downloads folder.';
+    setTimeout(() => { if(statusEl.textContent.startsWith('✔')) statusEl.textContent = ''; }, 6000);
+  }catch(e){
+    statusEl.textContent = '❌ Could not reach the server to download the file (' + e.message + '). Check your internet connection and try again in a moment.';
+  }finally{
+    btn.disabled = false;
+    btn.textContent = origLabel;
   }
 }
 
@@ -1701,6 +1941,11 @@ async function createNewCustomer(){
 // after a profile was still loading could clear the profile area only for
 // the in-flight lookup to land a moment later and put it right back.
 let profileRenderGen = {};
+// Caches each open profile's product history by targetId, so the "Has she
+// received this before?" dropdown can filter instantly against it on
+// every keystroke with no extra network call -- the same data the
+// profile's own "Full product history" section already has.
+let customerHistoryCache = {};
 
 async function renderProfileInto(targetId, name){
   const myGen = (profileRenderGen[targetId] = (profileRenderGen[targetId] || 0) + 1);
@@ -1722,6 +1967,7 @@ async function renderProfileInto(targetId, name){
   const months = [...new Set(data.product_history.map(p=>p.month))].filter(Boolean).sort();
   const byMonth = {};
   data.product_history.forEach(p=>{ (byMonth[p.month] = byMonth[p.month]||[]).push(p.product); });
+  customerHistoryCache[targetId] = data.product_history || [];
 
   // Full frequency breakdown — every level she was ever asked about, not
   // just "Often". Grouped by level so it reads the same way the quiz did.
@@ -1881,6 +2127,19 @@ async function renderProfileInto(targetId, name){
       </div>
 
       <div class="compact-summary">
+        ${(() => {
+          const sc = data.preferences && data.preferences.skin_concerns;
+          const scVals = sc ? (Array.isArray(sc) ? sc : [sc]).filter(Boolean) : [];
+          // Pulled up to the very top of this section, ahead of Quiz basics
+          // -- Iqra wants skincare concerns to be the first thing she sees
+          // here instead of buried further down in the general Preferences
+          // list below (which still shows everything else as before).
+          return scVals.length ? `
+        <div class="section-label">Skin concerns</div>
+        <div class="compact-line">${scVals.join(', ')}</div>
+          ` : '';
+        })()}
+
         ${(data.quiz && (data.quiz.skin_tone||data.quiz.eye_color||data.quiz.hair_color||data.quiz.makeup_comfort)) ? `
         <div class="section-label">Quiz basics</div>
         <div class="compact-line">
@@ -1905,9 +2164,9 @@ async function renderProfileInto(targetId, name){
         `).join('')}
         ` : ''}
 
-        ${data.preferences && Object.keys(data.preferences).length ? `
+        ${data.preferences && Object.keys(data.preferences).filter(k=>k!=='skin_concerns').length ? `
         <div class="section-label">Preferences</div>
-        ${Object.entries(data.preferences).map(([k,v]) => {
+        ${Object.entries(data.preferences).filter(([k])=>k!=='skin_concerns').map(([k,v]) => {
           const vals = (Array.isArray(v)?v:[v]).filter(Boolean).join(', ');
           return vals ? `<div class="compact-line"><span class="lbl">${labelize(k)}:</span> ${vals}</div>` : '';
         }).join('')}
@@ -1956,8 +2215,7 @@ async function renderProfileInto(targetId, name){
       <div class="check-box">
         <label>💬 "Has she received this before?"</label>
         <div class="check-row">
-          <input id="checkInput-${targetId}" placeholder="Type a product name…">
-          <button onclick="checkProduct('${targetId}', '${data.customer_name.replace(/'/g,"\\'")}')">Check</button>
+          <input id="checkInput-${targetId}" placeholder="Type a product name… (shows every match, not just one)" oninput="renderProductCheckDropdown('${targetId}', this.value)" autocomplete="off">
         </div>
         <div class="check-result" id="checkResult-${targetId}"></div>
       </div>
@@ -2090,22 +2348,41 @@ async function saveNotes(customerId, targetId, customerName){
   }catch(e){ alert('Could not save notes: ' + e.message); }
 }
 
-async function checkProduct(targetId, customerName){
-  const inputEl = document.getElementById('checkInput-'+targetId);
+// Replaces the old "type the full name, click Check, get back just the
+// FIRST match" flow -- she could have received several similarly-named
+// products (e.g. different shades/editions of a mascara) and only ever
+// saw one of them. This filters her whole history live as she types and
+// lists every match, each with the month she got it, straight from the
+// product_history already loaded for this profile (see
+// customerHistoryCache above) -- no extra request, so it updates on every
+// keystroke with no lag.
+function renderProductCheckDropdown(targetId, val){
   const resultEl = document.getElementById('checkResult-'+targetId);
-  if(!inputEl || !resultEl) return;
-  const val = inputEl.value.trim();
-  if(!val) return;
-  const data = await api(`/customer_search_product?name=${encodeURIComponent(customerName)}&product=${encodeURIComponent(val)}`);
+  if(!resultEl) return;
+  const q = (val||'').trim().toLowerCase();
+  if(!q){ resultEl.className = 'check-result'; resultEl.innerHTML = ''; return; }
+
+  const history = customerHistoryCache[targetId] || [];
+  const matches = history.filter(p => (p.product||'').toLowerCase().includes(q));
   resultEl.classList.add('show');
-  if(data && data.has_received){
+  if(matches.length){
     resultEl.className = 'check-result show yes';
-    resultEl.textContent = `Yes — she received "${data.matches[0].product}" in ${data.matches[0].month}.`;
+    resultEl.innerHTML = `<div style="font-weight:700;margin-bottom:4px;">Yes — ${matches.length} match${matches.length===1?'':'es'} found:</div>` +
+      matches.map(m => `<div class="row-line" style="padding:3px 0;"><span>${m.product}</span><span class="pill green" style="margin-left:8px;">${m.month}</span></div>`).join('');
   } else {
     resultEl.className = 'check-result show no';
     resultEl.textContent = `No record of that — safe to recommend.`;
   }
 }
+
+/* ---------------- back-to-top button (every page) ---------------- */
+// One fixed button shared across all pages rather than one per page --
+// shows once she's scrolled down a bit, hidden near the top where it'd
+// just be in the way.
+window.addEventListener('scroll', () => {
+  const btn = document.getElementById('backToTopBtn');
+  if(btn) btn.style.display = (window.scrollY > 300) ? 'flex' : 'none';
+}, {passive: true});
 
 /* ---------------- init ---------------- */
 loadBoard();
